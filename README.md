@@ -2,12 +2,12 @@
 
 Kernel polyfill for `mul_cvt_bf16_to_fp4_4x_with_stochastic_rounding` on devices
 that lack the `cvt.rs.satfinite.e2m1x4.f32` PTX instruction — primarily the
-NVIDIA RTX 5090 (Blackwell, SM120) and DGX Spark (SM121).
+NVIDIA RTX 50x0 series (Blackwell, SM120) and DGX Spark (SM121).
 
 ## Background
 
-SM120a removed the single-instruction stochastic-rounding FP4 conversion
-(`cvt.rs.satfinite.e2m1x4.f32`) that was available on SM100a. The replacement
+SM120 family removed the single-instruction stochastic-rounding FP4 conversion
+(`cvt.rs.satfinite.e2m1x4.f32`) that was available on SM100. The existing
 instruction `cvt.rn.satfinite.e2m1x2.f32` only supports **round-to-nearest** and
 packs **2** E2M1 values at a time instead of 4.
 
