@@ -5,7 +5,7 @@
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 
-#include "cvt.claude.cuh"
+#include "sr.sm120.cuh"
 
 // ===================================================================
 // E2M1 decode helper

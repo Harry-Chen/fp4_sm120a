@@ -5,8 +5,8 @@
 //
 // Contains three implementations of each function:
 //   native_*    — uses cvt.rs.satfinite.e2m1x4.f32 (SM100a hardware SR)
-//   claude_*    — software SR noise + cvt.rn.satfinite.e2m1x2.f32
-//   chatgpt_*   — pure software quantization (no special PTX needed)
+//   sm120_*     — software SR noise + cvt.rn.satfinite.e2m1x2.f32
+//   software_*  — pure software quantization (no special PTX needed)
 //
 
 #include <cstdint>
@@ -62,11 +62,11 @@ fp4e2m1x4 native_cvt_fp32_to_fp4_4x_sr(
 }
 
 // ===================================================================
-// CLAUDE polyfill: software SR noise + cvt.rn.satfinite.e2m1x2.f32
+// SM120 polyfill: software SR noise + cvt.rn.satfinite.e2m1x2.f32
 // ===================================================================
 
 __device__ __forceinline__
-float claude_apply_sr_noise_e2m1(float x, unsigned rand_byte) {
+float sm120_apply_sr_noise_e2m1(float x, unsigned rand_byte) {
     unsigned u = __float_as_uint(x);
     unsigned abs_u = u & 0x7FFFFFFFu;
     unsigned exp = abs_u >> 23;
@@ -83,7 +83,7 @@ float claude_apply_sr_noise_e2m1(float x, unsigned rand_byte) {
 }
 
 __device__ __forceinline__
-unsigned short claude_cvt_e2m1x4_rn(float a, float b, float c, float d) {
+unsigned short sm120_cvt_e2m1x4_rn(float a, float b, float c, float d) {
     // Hardware e2m1x4 layout: {a,b,c,d} → bits[3:0]=d, [7:4]=c, [11:8]=b, [15:12]=a
     unsigned short result;
     asm volatile(
@@ -105,17 +105,17 @@ unsigned short claude_cvt_e2m1x4_rn(float a, float b, float c, float d) {
 }
 
 __device__ __forceinline__
-unsigned short claude_fp32x4_to_e2m1x4_sr(float a, float b, float c, float d,
+unsigned short sm120_fp32x4_to_e2m1x4_sr(float a, float b, float c, float d,
                                             unsigned rbits) {
-    a = claude_apply_sr_noise_e2m1(a, (rbits      ) & 0xFFu);
-    b = claude_apply_sr_noise_e2m1(b, (rbits >>  8) & 0xFFu);
-    c = claude_apply_sr_noise_e2m1(c, (rbits >> 16) & 0xFFu);
-    d = claude_apply_sr_noise_e2m1(d, (rbits >> 24) & 0xFFu);
-    return claude_cvt_e2m1x4_rn(a, b, c, d);
+    a = sm120_apply_sr_noise_e2m1(a, (rbits      ) & 0xFFu);
+    b = sm120_apply_sr_noise_e2m1(b, (rbits >>  8) & 0xFFu);
+    c = sm120_apply_sr_noise_e2m1(c, (rbits >> 16) & 0xFFu);
+    d = sm120_apply_sr_noise_e2m1(d, (rbits >> 24) & 0xFFu);
+    return sm120_cvt_e2m1x4_rn(a, b, c, d);
 }
 
 __device__ __forceinline__
-fp4e2m1x4 claude_mul_cvt_bf16_to_fp4_4x_sr(
+fp4e2m1x4 sm120_mul_cvt_bf16_to_fp4_4x_sr(
     const uint64_t in_4x, const float2 scale, const uint32_t rbits) {
     float v0, v1, v2, v3;
     asm volatile(
@@ -138,24 +138,24 @@ fp4e2m1x4 claude_mul_cvt_bf16_to_fp4_4x_sr(
         : "l"(in_4x), "l"(reinterpret_cast<const uint64_t &>(scale))
     );
     fp4e2m1x4 r;
-    r.__x = claude_fp32x4_to_e2m1x4_sr(v2, v3, v0, v1, rbits);
+    r.__x = sm120_fp32x4_to_e2m1x4_sr(v2, v3, v0, v1, rbits);
     return r;
 }
 
 __device__ __forceinline__
-fp4e2m1x4 claude_cvt_fp32_to_fp4_4x_sr(
+fp4e2m1x4 sm120_cvt_fp32_to_fp4_4x_sr(
     const float2 in01, const float2 in23, const uint32_t rbits) {
     fp4e2m1x4 r;
-    r.__x = claude_fp32x4_to_e2m1x4_sr(in23.y, in23.x, in01.y, in01.x, rbits);
+    r.__x = sm120_fp32x4_to_e2m1x4_sr(in23.y, in23.x, in01.y, in01.x, rbits);
     return r;
 }
 
 // ===================================================================
-// CHATGPT polyfill: pure software quantization
+// SOFTWARE polyfill: pure software quantization
 // ===================================================================
 
 __device__ __forceinline__
-uint32_t chatgpt_mix_lane_bits(uint32_t rbits, int lane) {
+uint32_t software_mix_lane_bits(uint32_t rbits, int lane) {
     uint32_t x = rbits ^ (0x9E3779B9u * (uint32_t)(lane + 1));
     x ^= x >> 16; x *= 0x7FEB352Du;
     x ^= x >> 15; x *= 0x846CA68Bu;
@@ -164,18 +164,18 @@ uint32_t chatgpt_mix_lane_bits(uint32_t rbits, int lane) {
 }
 
 __device__ __forceinline__
-uint8_t chatgpt_pack_fp4_e2m1(bool neg, uint8_t mag_code) {
+uint8_t software_pack_fp4_e2m1(bool neg, uint8_t mag_code) {
     return (uint8_t)((neg ? 0x8 : 0x0) | (mag_code & 0x7));
 }
 
 __device__ __forceinline__
-float chatgpt_fp4_e2m1_code_to_abs_float(uint8_t mag_code) {
+float software_fp4_e2m1_code_to_abs_float(uint8_t mag_code) {
     const float t[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
     return t[mag_code & 0x7];
 }
 
 __device__ __forceinline__
-uint64_t chatgpt_prob_to_threshold_u32(float p_up) {
+uint64_t software_prob_to_threshold_u32(float p_up) {
     if (!(p_up > 0.0f)) return 0ull;
     if (p_up >= 1.0f) return (1ull << 32);
     uint64_t thr = (uint64_t)((double)p_up * 4294967296.0);
@@ -184,51 +184,51 @@ uint64_t chatgpt_prob_to_threshold_u32(float p_up) {
 }
 
 __device__ __forceinline__
-uint8_t chatgpt_quantize_fp32_to_fp4_e2m1_sr(float x, uint32_t rnd) {
+uint8_t software_quantize_fp32_to_fp4_e2m1_sr(float x, uint32_t rnd) {
     if (!isfinite(x))
-        return chatgpt_pack_fp4_e2m1(signbit(x), 7);
+        return software_pack_fp4_e2m1(signbit(x), 7);
     bool neg = signbit(x);
     float ax = fabsf(x);
     if (ax >= 6.0f)
-        return chatgpt_pack_fp4_e2m1(neg, 7);
+        return software_pack_fp4_e2m1(neg, 7);
     const float kVals[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
     for (uint8_t i = 0; i < 8; ++i)
-        if (ax == kVals[i]) return chatgpt_pack_fp4_e2m1(neg, i);
+        if (ax == kVals[i]) return software_pack_fp4_e2m1(neg, i);
     uint8_t hi = 1;
     while (hi < 8 && !(ax < kVals[hi])) ++hi;
     uint8_t lo = hi - 1;
     float p_up = (ax - kVals[lo]) / (kVals[hi] - kVals[lo]);
-    uint64_t threshold = chatgpt_prob_to_threshold_u32(p_up);
+    uint64_t threshold = software_prob_to_threshold_u32(p_up);
     uint8_t chosen = ((uint64_t)rnd < threshold) ? hi : lo;
-    return chatgpt_pack_fp4_e2m1(neg, chosen);
+    return software_pack_fp4_e2m1(neg, chosen);
 }
 
 __device__ __forceinline__
-uint16_t chatgpt_fp32x4_to_fp4_nibbles_sr(
+uint16_t software_fp32x4_to_fp4_nibbles_sr(
     float v0, float v1, float v2, float v3, uint32_t rbits) {
-    uint8_t q0 = chatgpt_quantize_fp32_to_fp4_e2m1_sr(v0, chatgpt_mix_lane_bits(rbits, 0));
-    uint8_t q1 = chatgpt_quantize_fp32_to_fp4_e2m1_sr(v1, chatgpt_mix_lane_bits(rbits, 1));
-    uint8_t q2 = chatgpt_quantize_fp32_to_fp4_e2m1_sr(v2, chatgpt_mix_lane_bits(rbits, 2));
-    uint8_t q3 = chatgpt_quantize_fp32_to_fp4_e2m1_sr(v3, chatgpt_mix_lane_bits(rbits, 3));
+    uint8_t q0 = software_quantize_fp32_to_fp4_e2m1_sr(v0, software_mix_lane_bits(rbits, 0));
+    uint8_t q1 = software_quantize_fp32_to_fp4_e2m1_sr(v1, software_mix_lane_bits(rbits, 1));
+    uint8_t q2 = software_quantize_fp32_to_fp4_e2m1_sr(v2, software_mix_lane_bits(rbits, 2));
+    uint8_t q3 = software_quantize_fp32_to_fp4_e2m1_sr(v3, software_mix_lane_bits(rbits, 3));
     return (uint16_t)((q0 & 0xF) | ((q1 & 0xF) << 4) | ((q2 & 0xF) << 8) | ((q3 & 0xF) << 12));
 }
 
 __device__ __forceinline__
-fp4e2m1x4 chatgpt_mul_cvt_bf16_to_fp4_4x_sr(
+fp4e2m1x4 software_mul_cvt_bf16_to_fp4_4x_sr(
     const uint64_t in_4x, const float2 scale, const uint32_t rbits) {
     float v0 = __uint_as_float((uint32_t)(uint16_t)(in_4x      ) << 16) * scale.x;
     float v1 = __uint_as_float((uint32_t)(uint16_t)(in_4x >> 16) << 16) * scale.y;
     float v2 = __uint_as_float((uint32_t)(uint16_t)(in_4x >> 32) << 16) * scale.x;
     float v3 = __uint_as_float((uint32_t)(uint16_t)(in_4x >> 48) << 16) * scale.y;
     fp4e2m1x4 r;
-    r.__x = chatgpt_fp32x4_to_fp4_nibbles_sr(v0, v1, v2, v3, rbits);
+    r.__x = software_fp32x4_to_fp4_nibbles_sr(v0, v1, v2, v3, rbits);
     return r;
 }
 
 __device__ __forceinline__
-fp4e2m1x4 chatgpt_cvt_fp32_to_fp4_4x_sr(
+fp4e2m1x4 software_cvt_fp32_to_fp4_4x_sr(
     const float2 in01, const float2 in23, const uint32_t rbits) {
     fp4e2m1x4 r;
-    r.__x = chatgpt_fp32x4_to_fp4_nibbles_sr(in01.x, in01.y, in23.x, in23.y, rbits);
+    r.__x = software_fp32x4_to_fp4_nibbles_sr(in01.x, in01.y, in23.x, in23.y, rbits);
     return r;
 }

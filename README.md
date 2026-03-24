@@ -11,43 +11,54 @@ SM120 family removed the single-instruction stochastic-rounding FP4 conversion
 instruction `cvt.rn.satfinite.e2m1x2.f32` only supports **round-to-nearest** and
 packs **2** E2M1 values at a time instead of 4.
 
-This repo contains two independent polyfill implementations — one generated with
-Claude, one with ChatGPT — that restore stochastic rounding semantics on top of
-the available hardware.
+This repo contains two independent polyfill implementations — one targeting
+SM120 hardware, one pure software — that restore stochastic rounding semantics
+on top of the available hardware.
 
 ## File Structure
 
 ```
-cvt.claude.cuh      # Drop-in header: hardware RN + software SR noise
-cvt.claude.cu       # Tests and benchmarks for the Claude implementation
-cvt.chatgpt.cuh     # Drop-in header: pure software quantization
-cvt.chatgpt.cu      # Tests and benchmarks for the ChatGPT implementation
+sr.sm120.cuh        # Drop-in header: hardware RN + software SR noise (SM120)
+sr.sm120.cu         # Tests and benchmarks for the SM120 implementation
+sr.software.cuh     # Drop-in header: pure software quantization
+sr.software.cu      # Tests and benchmarks for the software implementation
+compare.cuh         # Native + both polyfills side-by-side (for SM100 comparison)
+compare.cu          # Comparison tests: native vs polyfill on B300
 ```
 
 The `.cuh` headers are self-contained drop-in replacements with minimal
-dependencies — just include one and call `mul_cvt_bf16_to_fp4_4x_with_stochastic_rounding()`.
+dependencies — just include one and call the desired function.
+
+## Polyfilled Functions
+
+| Function | Inputs | Description |
+|----------|--------|-------------|
+| `mul_cvt_bf16_to_fp4_4x_with_stochastic_rounding` | 4x BF16 + float2 scale + rbits | BF16 multiply-and-quantize to FP4 with SR |
+| `mul_cvt_fp32_to_fp4_4x_with_stochastic_rounding` | 2x float2 + float2 scale + rbits | FP32 multiply-and-quantize to FP4 with SR |
+| `cvt_fp32_to_fp4_4x_with_stochastic_rounding` | 2x float2 + rbits | FP32 quantize to FP4 with SR (no scale) |
+| `mul_cvt_bf16_to_fp4_8x_stochastic_rounding` | 8x BF16 + scalar scale + 2x rbits | 8-wide BF16 multiply-and-quantize to FP4 with SR |
 
 ## Implementations
 
-### `cvt.claude.cuh` — Hardware RN + Software SR Noise
+### `sr.sm120.cuh` — Hardware RN + Software SR Noise
 
 Applies software stochastic rounding noise *before* the hardware round-to-nearest
 conversion, so the deterministic RN instruction produces stochastic rounding
 behavior:
 
-1. Convert 4x BF16 to FP32 and multiply by scale (`mul.f32x2`)
+1. Convert BF16 to FP32 and multiply by scale
 2. For each value, inject symmetric noise in [-ULP/2, ULP/2) clamped to the ULP
    floor (`apply_sr_noise_e2m1`), so `P(round_up) = (|x| - |x_lo|) / ULP`
 3. Pack with two `cvt.rn.satfinite.e2m1x2.f32` calls, combined into a 16-bit result
 
-It can be built on `sm_120f, sm_120a, sm_121a`.
+Requires `cvt.rn.satfinite.e2m1x2.f32` — builds on `sm_120f, sm_120a, sm_121a`.
 
-### `cvt.chatgpt.cuh` — Pure Software Quantization (with optional hardware path)
+### `sr.software.cuh` — Pure Software Quantization (with optional hardware path)
 
 Performs the full quantization in software using explicit bracket lookup and
 threshold comparison:
 
-1. Convert 4x BF16 to FP32, multiply by scale
+1. Convert BF16 to FP32, multiply by scale
 2. Find the E2M1 floor/ceil bracket for each value
 3. Compute `p_up = (|x| - floor) / (ceil - floor)`, convert to a 32-bit threshold
 4. Compare against per-lane random bits to decide round-up vs round-down
@@ -56,7 +67,7 @@ threshold comparison:
 Also includes a gated hardware path (`ARCH_HAS_STOCHASTIC_ROUNDING=1`) using
 the original `cvt.rs.satfinite.e2m1x4.f32` for architectures that support it.
 
-It is pure software implementation and can be built on any CUDA architecture.
+Pure software — can be built on any CUDA architecture.
 
 ## E2M1 Format
 
@@ -68,7 +79,7 @@ Representable values: {0, 0.5, 1, 1.5, 2, 3, 4, 6} (and their negatives).
 Requires CUDA toolkit with SM120 support (CUDA 12.8+).
 
 ```bash
-make            # builds cvt.claude.exe and cvt.chatgpt.exe
+make            # builds sr.sm120.exe and sr.software.exe
 make clean      # removes executables
 ```
 
@@ -79,9 +90,22 @@ your CUDA installation is not at `/usr/local/cuda`:
 make CUDA_HOME=/path/to/cuda CUDA_ARCH=121a
 ```
 
+### Comparison test (requires SM100 hardware, e.g. B300)
+
+```bash
+make compare.exe CUDA_ARCH=100a
+./compare.exe
+```
+
+This builds the native `cvt.rs.satfinite.e2m1x4.f32` implementation alongside
+both polyfills, runs them on the same random inputs, and reports:
+- Bit-exact match rate (SM120 polyfill vs native)
+- Per-nibble mean comparison (all three implementations)
+- Per-value unbiasedness: E[SR(x)] vs x for native, SM120, and software
+
 ## Test Suites
 
-### Claude (`cvt.claude.exe`)
+### SM120 (`sr.sm120.exe`)
 
 | Test | Description |
 |------|-------------|
@@ -91,9 +115,12 @@ make CUDA_HOME=/path/to/cuda CUDA_ARCH=121a
 | Test 3 | Exact representable values — SR of exact E2M1 values always returns itself |
 | Test 4 | Saturation — values beyond \|6.0\| clamp to +/-6.0 |
 | Test 5 | All 4 lanes — valid output and correct sign across all nibble positions |
+| Test 7 | E2E `mul_cvt_bf16_to_fp4_4x` — exact values, scale semantics, saturation, unbiasedness |
+| Test 8 | E2E `mul_cvt_fp32_to_fp4_4x` — exact values, scale semantics, unbiasedness |
+| Test 9 | E2E `mul_cvt_bf16_to_fp4_8x` — exact values, scalar scale, unbiasedness across 8 lanes |
 | Test 6 | Throughput benchmark — SR kernel vs read-only baseline at 4/64/256 MB |
 
-### ChatGPT (`cvt.chatgpt.exe`)
+### Software (`sr.software.exe`)
 
 | Test | Description |
 |------|-------------|
@@ -101,11 +128,19 @@ make CUDA_HOME=/path/to/cuda CUDA_ARCH=121a
 | Exact representables | All 15 exact E2M1 values round-trip correctly |
 | Saturation / specials | Overflow, infinity, and NaN clamp to +/-6.0 |
 | Scale semantics | Verifies even/odd lane scale factors (`scale.x` / `scale.y`) |
-| CPU/GPU consistency | 20,000 random cases compared between CPU reference and GPU kernel |
+| CPU/GPU consistency | 20,000 random cases for BF16-4x, FP32-4x, and BF16-8x vs CPU reference |
 | Probability suites | Round-up probability across 7 RNG streams at midpoint and non-midpoint |
 | Throughput benchmark | Quantize kernel vs stream baseline with effective bandwidth reporting |
+
+### Comparison (`compare.exe`, SM100 only)
+
+| Test | Description |
+|------|-------------|
+| Test 1 | `mul_cvt_bf16_to_fp4_4x` — bit-exact match + mean: native vs SM120 vs software |
+| Test 2 | `cvt_fp32_to_fp4_4x` — bit-exact match + mean: native vs SM120 vs software |
+| Test 3 | Per-value unbiasedness for `mul_cvt_bf16_to_fp4_4x` (16 test values, ~1M trials each) |
+| Test 4 | Per-value unbiasedness for `cvt_fp32_to_fp4_4x` (16 test values, ~1M trials each) |
 
 ## License
 
 Apache 2.0
-

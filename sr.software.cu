@@ -10,7 +10,7 @@
 #include <random>
 #include <vector>
 
-#include "cvt.chatgpt.cuh"
+#include "sr.software.cuh"
 
 static uint16_t float_to_bf16_rne_bits(float x) {
   uint32_t u;

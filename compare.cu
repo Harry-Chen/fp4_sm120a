@@ -1,5 +1,5 @@
 // ===================================================================
-// Comparison: native cvt.rs vs Claude polyfill vs ChatGPT polyfill
+// Comparison: native cvt.rs vs SM120 polyfill vs Software polyfill
 //
 // Build:  make compare.exe CUDA_ARCH=100a
 // Run on B300 (SM100a).
@@ -43,7 +43,7 @@ __host__ __device__ float e2m1_decode(unsigned code4) {
 }
 
 // ===================================================================
-// Generic comparison kernel: runs native + claude + chatgpt in one pass
+// Generic comparison kernel: runs native + sm120 + software in one pass
 // for mul_cvt_bf16_to_fp4_4x
 // ===================================================================
 
@@ -51,25 +51,25 @@ __global__ void kernel_compare_bf16_4x(
     const uint64_t *__restrict__ inputs,
     const float2 *__restrict__ scales,
     const uint32_t *__restrict__ rbits,
-    uint32_t *__restrict__ claude_mismatch,    // [1]
-    uint32_t *__restrict__ claude_nib_mm,      // [4]
+    uint32_t *__restrict__ sm120_mismatch,    // [1]
+    uint32_t *__restrict__ sm120_nib_mm,      // [4]
     double   *__restrict__ native_sums,        // [4]
-    double   *__restrict__ claude_sums,        // [4]
-    double   *__restrict__ chatgpt_sums,       // [4]
+    double   *__restrict__ sm120_sums,        // [4]
+    double   *__restrict__ software_sums,       // [4]
     int n
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
 
     uint16_t n_out = native_mul_cvt_bf16_to_fp4_4x_sr(inputs[idx], scales[idx], rbits[idx]).__x;
-    uint16_t c_out = claude_mul_cvt_bf16_to_fp4_4x_sr(inputs[idx], scales[idx], rbits[idx]).__x;
-    uint16_t g_out = chatgpt_mul_cvt_bf16_to_fp4_4x_sr(inputs[idx], scales[idx], rbits[idx]).__x;
+    uint16_t c_out = sm120_mul_cvt_bf16_to_fp4_4x_sr(inputs[idx], scales[idx], rbits[idx]).__x;
+    uint16_t g_out = software_mul_cvt_bf16_to_fp4_4x_sr(inputs[idx], scales[idx], rbits[idx]).__x;
 
     if (n_out != c_out) {
-        atomicAdd(claude_mismatch, 1u);
+        atomicAdd(sm120_mismatch, 1u);
         for (int nib = 0; nib < 4; nib++)
             if (((n_out >> (nib*4)) & 0xF) != ((c_out >> (nib*4)) & 0xF))
-                atomicAdd(&claude_nib_mm[nib], 1u);
+                atomicAdd(&sm120_nib_mm[nib], 1u);
     }
 
     for (int nib = 0; nib < 4; nib++) {
@@ -77,8 +77,8 @@ __global__ void kernel_compare_bf16_4x(
         double cd = (double)e2m1_decode((c_out >> (nib*4)) & 0xFu);
         double gd = (double)e2m1_decode((g_out >> (nib*4)) & 0xFu);
         atomicAdd(&native_sums[nib],  nd);
-        atomicAdd(&claude_sums[nib],  cd);
-        atomicAdd(&chatgpt_sums[nib], gd);
+        atomicAdd(&sm120_sums[nib],  cd);
+        atomicAdd(&software_sums[nib], gd);
     }
 }
 
@@ -90,25 +90,25 @@ __global__ void kernel_compare_fp32_4x(
     const float2 *__restrict__ in01s,
     const float2 *__restrict__ in23s,
     const uint32_t *__restrict__ rbits,
-    uint32_t *__restrict__ claude_mismatch,
-    uint32_t *__restrict__ claude_nib_mm,
+    uint32_t *__restrict__ sm120_mismatch,
+    uint32_t *__restrict__ sm120_nib_mm,
     double   *__restrict__ native_sums,
-    double   *__restrict__ claude_sums,
-    double   *__restrict__ chatgpt_sums,
+    double   *__restrict__ sm120_sums,
+    double   *__restrict__ software_sums,
     int n
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
 
     uint16_t n_out = native_cvt_fp32_to_fp4_4x_sr(in01s[idx], in23s[idx], rbits[idx]).__x;
-    uint16_t c_out = claude_cvt_fp32_to_fp4_4x_sr(in01s[idx], in23s[idx], rbits[idx]).__x;
-    uint16_t g_out = chatgpt_cvt_fp32_to_fp4_4x_sr(in01s[idx], in23s[idx], rbits[idx]).__x;
+    uint16_t c_out = sm120_cvt_fp32_to_fp4_4x_sr(in01s[idx], in23s[idx], rbits[idx]).__x;
+    uint16_t g_out = software_cvt_fp32_to_fp4_4x_sr(in01s[idx], in23s[idx], rbits[idx]).__x;
 
     if (n_out != c_out) {
-        atomicAdd(claude_mismatch, 1u);
+        atomicAdd(sm120_mismatch, 1u);
         for (int nib = 0; nib < 4; nib++)
             if (((n_out >> (nib*4)) & 0xF) != ((c_out >> (nib*4)) & 0xF))
-                atomicAdd(&claude_nib_mm[nib], 1u);
+                atomicAdd(&sm120_nib_mm[nib], 1u);
     }
 
     for (int nib = 0; nib < 4; nib++) {
@@ -116,8 +116,8 @@ __global__ void kernel_compare_fp32_4x(
         double cd = (double)e2m1_decode((c_out >> (nib*4)) & 0xFu);
         double gd = (double)e2m1_decode((g_out >> (nib*4)) & 0xFu);
         atomicAdd(&native_sums[nib],  nd);
-        atomicAdd(&claude_sums[nib],  cd);
-        atomicAdd(&chatgpt_sums[nib], gd);
+        atomicAdd(&sm120_sums[nib],  cd);
+        atomicAdd(&software_sums[nib], gd);
     }
 }
 
@@ -129,8 +129,8 @@ __global__ void kernel_compare_fp32_4x(
 __global__ void kernel_per_value_bf16(
     const float *__restrict__ test_vals,
     double *__restrict__ native_sums,   // [n_vals]
-    double *__restrict__ claude_sums,
-    double *__restrict__ chatgpt_sums,
+    double *__restrict__ sm120_sums,
+    double *__restrict__ software_sums,
     int n_vals, int n_trials
 ) {
     int vid = blockIdx.x;
@@ -150,8 +150,8 @@ __global__ void kernel_per_value_bf16(
     for (int i = 0; i < trials_per_thread; i++) {
         uint32_t rb = curand(&rng);
         float nd = e2m1_decode(native_mul_cvt_bf16_to_fp4_4x_sr(in_4x, scale, rb).__x & 0xFu);
-        float cd = e2m1_decode(claude_mul_cvt_bf16_to_fp4_4x_sr(in_4x, scale, rb).__x & 0xFu);
-        float gd = e2m1_decode(chatgpt_mul_cvt_bf16_to_fp4_4x_sr(in_4x, scale, rb).__x & 0xFu);
+        float cd = e2m1_decode(sm120_mul_cvt_bf16_to_fp4_4x_sr(in_4x, scale, rb).__x & 0xFu);
+        float gd = e2m1_decode(software_mul_cvt_bf16_to_fp4_4x_sr(in_4x, scale, rb).__x & 0xFu);
         ln += (double)nd; lc += (double)cd; lg += (double)gd;
     }
 
@@ -168,8 +168,8 @@ __global__ void kernel_per_value_bf16(
     }
     if (threadIdx.x == 0) {
         atomicAdd(&native_sums[vid],  sn[0]);
-        atomicAdd(&claude_sums[vid],  sc[0]);
-        atomicAdd(&chatgpt_sums[vid], sg[0]);
+        atomicAdd(&sm120_sums[vid],  sc[0]);
+        atomicAdd(&software_sums[vid], sg[0]);
     }
 }
 
@@ -177,8 +177,8 @@ __global__ void kernel_per_value_bf16(
 __global__ void kernel_per_value_fp32(
     const float *__restrict__ test_vals,
     double *__restrict__ native_sums,
-    double *__restrict__ claude_sums,
-    double *__restrict__ chatgpt_sums,
+    double *__restrict__ sm120_sums,
+    double *__restrict__ software_sums,
     int n_vals, int n_trials
 ) {
     int vid = blockIdx.x;
@@ -196,8 +196,8 @@ __global__ void kernel_per_value_fp32(
     for (int i = 0; i < trials_per_thread; i++) {
         uint32_t rb = curand(&rng);
         float nd = e2m1_decode(native_cvt_fp32_to_fp4_4x_sr(in01, in23, rb).__x & 0xFu);
-        float cd = e2m1_decode(claude_cvt_fp32_to_fp4_4x_sr(in01, in23, rb).__x & 0xFu);
-        float gd = e2m1_decode(chatgpt_cvt_fp32_to_fp4_4x_sr(in01, in23, rb).__x & 0xFu);
+        float cd = e2m1_decode(sm120_cvt_fp32_to_fp4_4x_sr(in01, in23, rb).__x & 0xFu);
+        float gd = e2m1_decode(software_cvt_fp32_to_fp4_4x_sr(in01, in23, rb).__x & 0xFu);
         ln += (double)nd; lc += (double)cd; lg += (double)gd;
     }
 
@@ -214,8 +214,8 @@ __global__ void kernel_per_value_fp32(
     }
     if (threadIdx.x == 0) {
         atomicAdd(&native_sums[vid],  sn[0]);
-        atomicAdd(&claude_sums[vid],  sc[0]);
-        atomicAdd(&chatgpt_sums[vid], sg[0]);
+        atomicAdd(&sm120_sums[vid],  sc[0]);
+        atomicAdd(&software_sums[vid], sg[0]);
     }
 }
 
@@ -225,15 +225,15 @@ __global__ void kernel_per_value_fp32(
 
 static void print_per_value_table(const char *title,
                                    const float *vals, int n_vals, int n_trials,
-                                   const double *h_native, const double *h_claude,
-                                   const double *h_chatgpt) {
+                                   const double *h_native, const double *h_sm120,
+                                   const double *h_software) {
     printf("  %-8s  %-11s  %-11s  %-11s  %-11s  %-11s  %-11s\n",
-           "x", "E[native]", "E[claude]", "E[chatgpt]",
+           "x", "E[native]", "E[sm120]", "E[software]",
            "bias_nat", "bias_cla", "bias_gpt");
     for (int i = 0; i < n_vals; i++) {
         double en = h_native[i]  / (double)n_trials;
-        double ec = h_claude[i]  / (double)n_trials;
-        double eg = h_chatgpt[i] / (double)n_trials;
+        double ec = h_sm120[i]  / (double)n_trials;
+        double eg = h_software[i] / (double)n_trials;
         printf("  %+7.3f   %+10.6f   %+10.6f   %+10.6f   %+10.6f   %+10.6f   %+10.6f\n",
                vals[i], en, ec, eg,
                en - (double)vals[i], ec - (double)vals[i], eg - (double)vals[i]);
@@ -306,13 +306,13 @@ int main() {
         CUDA_CHECK(cudaMemcpy(h_cs, d_cs, 4*sizeof(double), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(h_gs, d_gs, 4*sizeof(double), cudaMemcpyDeviceToHost));
 
-        printf("  Claude vs Native bit-exact:\n");
+        printf("  SM120 vs Native bit-exact:\n");
         printf("    Mismatched: %u / %d (%.4f%%)\n", h_cmm, N, 100.0*h_cmm/N);
         for (int i = 0; i < 4; i++)
             printf("    Nibble %d: %u mismatches (%.4f%%)\n", i, h_cnib[i], 100.0*h_cnib[i]/N);
 
         printf("  Mean decoded per nibble (over %d samples):\n", N);
-        printf("    %-8s  %-12s  %-12s  %-12s\n", "nibble", "native", "claude", "chatgpt");
+        printf("    %-8s  %-12s  %-12s  %-12s\n", "nibble", "native", "sm120", "software");
         for (int i = 0; i < 4; i++)
             printf("    %-8d  %+12.4f  %+12.4f  %+12.4f\n",
                    i, h_ns[i]/N, h_cs[i]/N, h_gs[i]/N);
@@ -374,13 +374,13 @@ int main() {
         CUDA_CHECK(cudaMemcpy(h_cs, d_cs, 4*sizeof(double), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(h_gs, d_gs, 4*sizeof(double), cudaMemcpyDeviceToHost));
 
-        printf("  Claude vs Native bit-exact:\n");
+        printf("  SM120 vs Native bit-exact:\n");
         printf("    Mismatched: %u / %d (%.4f%%)\n", h_cmm, N, 100.0*h_cmm/N);
         for (int i = 0; i < 4; i++)
             printf("    Nibble %d: %u mismatches (%.4f%%)\n", i, h_cnib[i], 100.0*h_cnib[i]/N);
 
         printf("  Mean decoded per nibble (over %d samples):\n", N);
-        printf("    %-8s  %-12s  %-12s  %-12s\n", "nibble", "native", "claude", "chatgpt");
+        printf("    %-8s  %-12s  %-12s  %-12s\n", "nibble", "native", "sm120", "software");
         for (int i = 0; i < 4; i++)
             printf("    %-8d  %+12.4f  %+12.4f  %+12.4f\n",
                    i, h_ns[i]/N, h_cs[i]/N, h_gs[i]/N);
@@ -471,10 +471,10 @@ int main() {
     }
 
     // ================================================================
-    // Test 5: Exact representable values (must always match for claude)
+    // Test 5: Exact representable values (must always match for sm120)
     // ================================================================
     {
-        printf("[Test 5] Exact representable values (claude must match native)\n");
+        printf("[Test 5] Exact representable values (sm120 must match native)\n");
         const float exact[] = {
             0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
             -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
