@@ -233,6 +233,30 @@ __device__ __forceinline__ fp4e2m1x4 mul_cvt_fp32_to_fp4_4x_with_stochastic_roun
 }
 
 // ===================================================================
+// FP32 input, no scale
+// ===================================================================
+
+__device__ __forceinline__ fp4e2m1x4 cvt_fp32_to_fp4_4x_with_stochastic_rounding(
+    const float2 in01, const float2 in23, const uint32_t rbits) {
+  uint16_t out_4x = 0;
+
+  constexpr bool has_rs = ARCH_HAS_STOCHASTIC_ROUNDING;
+  if constexpr (has_rs) {
+    asm volatile(
+        "{\n"
+        "cvt.rs.satfinite.e2m1x4.f32 %0, {%3, %4, %1, %2}, %5; \n\t"
+        "}"
+        : "=h"(out_4x)
+        : "f"(in01.y), "f"(in01.x), "f"(in23.y), "f"(in23.x), "r"(rbits));
+  } else {
+    out_4x = fp32x4_to_fp4_nibbles_sr(
+        in01.x, in01.y, in23.x, in23.y, rbits);
+  }
+
+  return make_fp4e2m1x4(out_4x);
+}
+
+// ===================================================================
 // 8x BF16->FP4 with stochastic rounding and scalar scale
 // ===================================================================
 

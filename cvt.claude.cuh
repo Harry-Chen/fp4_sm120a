@@ -62,12 +62,12 @@ float apply_sr_noise_e2m1(float x, unsigned rand_byte) {
 //   r8[7:4] = e2m1(src1)    <- high nibble
 //   r8[3:0] = e2m1(src2)    <- low nibble
 //
-// Original e2m1x4 layout: cvt.*.e2m1x4 %0, {a, b, c, d}
-//   bits[3:0]=a, [7:4]=b, [11:8]=c, [15:12]=d
+// Hardware e2m1x4 layout: cvt.*.e2m1x4 %0, {a, b, c, d}
+//   bits[3:0]=d, [7:4]=c, [11:8]=b, [15:12]=a   (reversed!)
 //
 // To reproduce with two e2m1x2 calls:
-//   lo8 = cvt(b, a)  ->  lo8[3:0]=a, lo8[7:4]=b
-//   hi8 = cvt(d, c)  ->  hi8[3:0]=c, hi8[7:4]=d
+//   lo8 = cvt(c, d)  ->  lo8[3:0]=d, lo8[7:4]=c
+//   hi8 = cvt(a, b)  ->  hi8[3:0]=b, hi8[7:4]=a
 //   result = lo8 | (hi8 << 8)
 
 __device__ __forceinline__
@@ -77,8 +77,8 @@ unsigned short cvt_e2m1x4_rn(float a, float b, float c, float d) {
         "{\n\t"
         ".reg .b8  lo8, hi8;\n\t"
         ".reg .b32 lo32, hi32, packed32;\n\t"
-        "cvt.rn.satfinite.e2m1x2.f32 lo8, %2, %1;\n\t"  // (b, a) -> a=low, b=high
-        "cvt.rn.satfinite.e2m1x2.f32 hi8, %4, %3;\n\t"  // (d, c) -> c=low, d=high
+        "cvt.rn.satfinite.e2m1x2.f32 lo8, %3, %4;\n\t"  // (c, d) -> d=low, c=high
+        "cvt.rn.satfinite.e2m1x2.f32 hi8, %1, %2;\n\t"  // (a, b) -> b=low, a=high
         "cvt.u32.u8 lo32, lo8;\n\t"
         "cvt.u32.u8 hi32, hi8;\n\t"
         "shl.b32 hi32, hi32, 8;\n\t"
@@ -135,7 +135,7 @@ fp4e2m1x4 mul_cvt_bf16_to_fp4_4x_with_stochastic_rounding(
     );
 
     // Original: cvt.rs.satfinite.e2m1x4.f32 %0, {v2, v3, v0, v1}, rbits
-    // Layout:   nibble0=v2, nibble1=v3, nibble2=v0, nibble3=v1
+    // Hardware layout (reversed): nibble0=v1, nibble1=v0, nibble2=v3, nibble3=v2
     fp4e2m1x4 result;
     result.__x = fp32x4_to_e2m1x4_sr(v2, v3, v0, v1, rbits);
     return result;
@@ -173,6 +173,23 @@ fp4e2m1x4 mul_cvt_fp32_to_fp4_4x_with_stochastic_rounding(
 
     fp4e2m1x4 result;
     result.__x = fp32x4_to_e2m1x4_sr(v2, v3, v0, v1, rbits);
+    return result;
+}
+
+// ===================================================================
+// FP32 input, no scale: drop-in replacement for
+// cvt.rs.satfinite.e2m1x4.f32 with float2 inputs (no multiply)
+// ===================================================================
+//
+// Native asm: cvt.rs.satfinite.e2m1x4.f32 %0, {in23.y, in23.x, in01.y, in01.x}, rbits
+// Hardware reversed layout: nibble0=in01.x, nibble1=in01.y, nibble2=in23.x, nibble3=in23.y
+
+__device__ __forceinline__
+fp4e2m1x4 cvt_fp32_to_fp4_4x_with_stochastic_rounding(
+    const float2 in01, const float2 in23, const uint32_t rbits) {
+
+    fp4e2m1x4 result;
+    result.__x = fp32x4_to_e2m1x4_sr(in23.y, in23.x, in01.y, in01.x, rbits);
     return result;
 }
 
