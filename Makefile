@@ -4,17 +4,17 @@ NVCC_FLAGS := -gencode=arch=compute_120a,code=sm_120a -Xptxas=-v -O3 -std=c++20 
 
 SRC := $(wildcard *.cu)
 EXE := $(SRC:%.cu=%.exe)
+PTX := $(SRC:%.cu=%.ptx)
 
 all: $(EXE)
 
-# Header dependencies
-cvt.claude.exe: cvt.claude.cu cvt.claude.cuh
-cvt.chatgpt.exe: cvt.chatgpt.cu cvt.chatgpt.cuh
-
-%.exe: %.cu
+%.exe: %.cu %.cuh
 	$(NVCC) $(NVCC_FLAGS) $< -o $@
+
+%.ptx: %.cu %.cuh
+	$(NVCC) $(NVCC_FLAGS) -ptx $< -o $@
 
 .PHONY: all clean
 
 clean:
-	rm -rf *.exe
+	rm -rf *.exe *.ptx
