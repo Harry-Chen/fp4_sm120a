@@ -20,6 +20,8 @@
 #include <cstdint>
 #include <cstdio>
 
+#include "sr.sm120.cuh"  // cvt_e2m1x4_rn, fp32x4_to_e2m1x4_sr, apply_sr_noise_e2m1
+
 namespace rht_gemm_sm120 {
 
 // ============================================================
@@ -55,63 +57,6 @@ float ue4m3_to_float(uint8_t val) {
     uint32_t packed;
     asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(packed) : "h"(bits));
     return __half2float(reinterpret_cast<__half2 const&>(packed).x);
-}
-
-// ============================================================
-// FP4 E2M1 conversion (round-to-nearest)
-// bits[3:0]=d, [7:4]=c, [11:8]=b, [15:12]=a
-// ============================================================
-
-__device__ __forceinline__
-uint16_t cvt_e2m1x4_rn(float a, float b, float c, float d) {
-    uint16_t result;
-    asm volatile(
-        "{\n\t"
-        ".reg .b8  lo8, hi8;\n\t"
-        ".reg .b32 lo32, hi32, packed32;\n\t"
-        "cvt.rn.satfinite.e2m1x2.f32 lo8, %3, %4;\n\t"
-        "cvt.rn.satfinite.e2m1x2.f32 hi8, %1, %2;\n\t"
-        "cvt.u32.u8 lo32, lo8;\n\t"
-        "cvt.u32.u8 hi32, hi8;\n\t"
-        "shl.b32 hi32, hi32, 8;\n\t"
-        "or.b32  packed32, lo32, hi32;\n\t"
-        "cvt.u16.u32 %0, packed32;\n\t"
-        "}"
-        : "=h"(result)
-        : "f"(a), "f"(b), "f"(c), "f"(d)
-    );
-    return result;
-}
-
-// ============================================================
-// Stochastic rounding noise injection for E2M1
-// ============================================================
-
-__device__ __forceinline__
-float apply_sr_noise_e2m1(float x, unsigned rand_byte) {
-    unsigned u = __float_as_uint(x);
-    unsigned abs_u = u & 0x7FFFFFFFu;
-    unsigned exp = abs_u >> 23;
-    unsigned ulp_bexp = min(max(exp, 127u), 129u) - 1u;
-    float ulp = __uint_as_float(ulp_bexp << 23);
-    float x_lo_abs;
-    if (exp >= 127u) {
-        x_lo_abs = __uint_as_float(abs_u & 0xFFC00000u);
-    } else {
-        x_lo_abs = (exp >= 126u) ? 0.5f : 0.0f;
-    }
-    float noise = (float)((int)rand_byte - 127.5f) * __uint_as_float(0x3B800000u) * ulp;
-    float ax_noisy = fmaxf(fabsf(x) + noise, x_lo_abs);
-    return copysignf(ax_noisy, x);
-}
-
-__device__ __forceinline__
-uint16_t cvt_e2m1x4_sr(float a, float b, float c, float d, uint32_t rbits) {
-    a = apply_sr_noise_e2m1(a, (rbits      ) & 0xFFu);
-    b = apply_sr_noise_e2m1(b, (rbits >>  8) & 0xFFu);
-    c = apply_sr_noise_e2m1(c, (rbits >> 16) & 0xFFu);
-    d = apply_sr_noise_e2m1(d, (rbits >> 24) & 0xFFu);
-    return cvt_e2m1x4_rn(a, b, c, d);
 }
 
 // ============================================================
@@ -307,11 +252,11 @@ rht_gemm_kernel(
                 Philox4x32 rng;
                 rng.init(rng_seed, rng_seq, rng_offset);
                 uint4 rand = rng.generate();
-                packed_lo = cvt_e2m1x4_sr(vals[3], vals[2], vals[1], vals[0], rand.x);
-                packed_hi = cvt_e2m1x4_sr(vals[7], vals[6], vals[5], vals[4], rand.y);
+                packed_lo = ::fp32x4_to_e2m1x4_sr(vals[3], vals[2], vals[1], vals[0], rand.x);
+                packed_hi = ::fp32x4_to_e2m1x4_sr(vals[7], vals[6], vals[5], vals[4], rand.y);
             } else {
-                packed_lo = cvt_e2m1x4_rn(vals[3], vals[2], vals[1], vals[0]);
-                packed_hi = cvt_e2m1x4_rn(vals[7], vals[6], vals[5], vals[4]);
+                packed_lo = ::cvt_e2m1x4_rn(vals[3], vals[2], vals[1], vals[0]);
+                packed_hi = ::cvt_e2m1x4_rn(vals[7], vals[6], vals[5], vals[4]);
             }
             uint32_t packed = static_cast<uint32_t>(packed_lo)
                             | (static_cast<uint32_t>(packed_hi) << 16);
