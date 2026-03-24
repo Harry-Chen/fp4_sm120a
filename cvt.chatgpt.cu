@@ -43,6 +43,45 @@ static uint16_t cpu_reference(uint64_t in_4x, float2 scale, uint32_t rbits) {
   return pack_4_fp4_nibbles(q0, q1, q2, q3);
 }
 
+static uint16_t cpu_reference_fp32(float2 in01, float2 in23, float2 scale, uint32_t rbits) {
+  const float v0 = in01.x * scale.x;
+  const float v1 = in01.y * scale.y;
+  const float v2 = in23.x * scale.x;
+  const float v3 = in23.y * scale.y;
+
+  const uint8_t q0 = quantize_fp32_to_fp4_e2m1_sr(v0, mix_lane_bits(rbits, 0));
+  const uint8_t q1 = quantize_fp32_to_fp4_e2m1_sr(v1, mix_lane_bits(rbits, 1));
+  const uint8_t q2 = quantize_fp32_to_fp4_e2m1_sr(v2, mix_lane_bits(rbits, 2));
+  const uint8_t q3 = quantize_fp32_to_fp4_e2m1_sr(v3, mix_lane_bits(rbits, 3));
+
+  return pack_4_fp4_nibbles(q0, q1, q2, q3);
+}
+
+static uint32_t cpu_reference_8x(uint64_t in03, uint64_t in47, float scale,
+                                  uint32_t rbits03, uint32_t rbits47) {
+  const float v0 = bf16_bits_to_float(get_bf16_lane(in03, 0)) * scale;
+  const float v1 = bf16_bits_to_float(get_bf16_lane(in03, 1)) * scale;
+  const float v2 = bf16_bits_to_float(get_bf16_lane(in03, 2)) * scale;
+  const float v3 = bf16_bits_to_float(get_bf16_lane(in03, 3)) * scale;
+  const float v4 = bf16_bits_to_float(get_bf16_lane(in47, 0)) * scale;
+  const float v5 = bf16_bits_to_float(get_bf16_lane(in47, 1)) * scale;
+  const float v6 = bf16_bits_to_float(get_bf16_lane(in47, 2)) * scale;
+  const float v7 = bf16_bits_to_float(get_bf16_lane(in47, 3)) * scale;
+
+  const uint8_t q0 = quantize_fp32_to_fp4_e2m1_sr(v0, mix_lane_bits(rbits03, 0));
+  const uint8_t q1 = quantize_fp32_to_fp4_e2m1_sr(v1, mix_lane_bits(rbits03, 1));
+  const uint8_t q2 = quantize_fp32_to_fp4_e2m1_sr(v2, mix_lane_bits(rbits03, 2));
+  const uint8_t q3 = quantize_fp32_to_fp4_e2m1_sr(v3, mix_lane_bits(rbits03, 3));
+  const uint8_t q4 = quantize_fp32_to_fp4_e2m1_sr(v4, mix_lane_bits(rbits47, 0));
+  const uint8_t q5 = quantize_fp32_to_fp4_e2m1_sr(v5, mix_lane_bits(rbits47, 1));
+  const uint8_t q6 = quantize_fp32_to_fp4_e2m1_sr(v6, mix_lane_bits(rbits47, 2));
+  const uint8_t q7 = quantize_fp32_to_fp4_e2m1_sr(v7, mix_lane_bits(rbits47, 3));
+
+  const uint16_t lo = pack_4_fp4_nibbles(q0, q1, q2, q3);
+  const uint16_t hi = pack_4_fp4_nibbles(q4, q5, q6, q7);
+  return (uint32_t)lo | ((uint32_t)hi << 16);
+}
+
 static void print_fp4x4(uint16_t bits) {
   for (int i = 0; i < 4; ++i) {
     const uint8_t nib = (bits >> (4 * i)) & 0xF;
@@ -56,6 +95,27 @@ __global__ void test_kernel(const uint64_t* __restrict__ in, const float2 scale,
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < n) {
     out[idx] = raw_bits(mul_cvt_bf16_to_fp4_4x_with_stochastic_rounding(in[idx], scale, rbits[idx]));
+  }
+}
+
+__global__ void test_fp32_kernel(const float2* __restrict__ in01, const float2* __restrict__ in23,
+                                const float2 scale, const uint32_t* __restrict__ rbits,
+                                uint16_t* __restrict__ out, int n) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    out[idx] = raw_bits(mul_cvt_fp32_to_fp4_4x_with_stochastic_rounding(
+        in01[idx], in23[idx], scale, rbits[idx]));
+  }
+}
+
+__global__ void test_8x_kernel(const uint64_t* __restrict__ in03, const uint64_t* __restrict__ in47,
+                               const float scale, const uint32_t* __restrict__ rbits03,
+                               const uint32_t* __restrict__ rbits47,
+                               uint32_t* __restrict__ out, int n) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    out[idx] = mul_cvt_bf16_to_fp4_8x_stochastic_rounding(
+        in03[idx], in47[idx], scale, rbits03[idx], rbits47[idx]);
   }
 }
 
@@ -341,6 +401,112 @@ static void test_probability_suites() {
   printf("\n");
 }
 
+static void test_fp32_cpu_gpu_consistency() {
+  printf("=== FP32 CPU/GPU consistency ===\n");
+  constexpr int N = 20000;
+  std::mt19937 rng(54321);
+  std::uniform_real_distribution<float> dist(-8.0f, 8.0f);
+  std::uniform_int_distribution<uint32_t> dist_u32(0u, 0xFFFFFFFFu);
+
+  std::vector<float2> h_in01(N), h_in23(N);
+  std::vector<uint32_t> h_rbits(N);
+  std::vector<uint16_t> h_out(N), h_ref(N);
+
+  const float2 scale = make_float2(0.75f, 1.25f);
+
+  for (int i = 0; i < N; ++i) {
+    h_in01[i] = make_float2(dist(rng), dist(rng));
+    h_in23[i] = make_float2(dist(rng), dist(rng));
+    h_rbits[i] = dist_u32(rng);
+    h_ref[i] = cpu_reference_fp32(h_in01[i], h_in23[i], scale, h_rbits[i]);
+  }
+
+  float2* d_in01 = nullptr; float2* d_in23 = nullptr;
+  uint32_t* d_rbits = nullptr; uint16_t* d_out = nullptr;
+  check_cuda(cudaMalloc(&d_in01, N * sizeof(float2)), "malloc d_in01");
+  check_cuda(cudaMalloc(&d_in23, N * sizeof(float2)), "malloc d_in23");
+  check_cuda(cudaMalloc(&d_rbits, N * sizeof(uint32_t)), "malloc d_rbits");
+  check_cuda(cudaMalloc(&d_out, N * sizeof(uint16_t)), "malloc d_out");
+
+  check_cuda(cudaMemcpy(d_in01, h_in01.data(), N * sizeof(float2), cudaMemcpyHostToDevice), "H2D in01");
+  check_cuda(cudaMemcpy(d_in23, h_in23.data(), N * sizeof(float2), cudaMemcpyHostToDevice), "H2D in23");
+  check_cuda(cudaMemcpy(d_rbits, h_rbits.data(), N * sizeof(uint32_t), cudaMemcpyHostToDevice), "H2D rbits");
+
+  test_fp32_kernel<<<(N + 255) / 256, 256>>>(d_in01, d_in23, scale, d_rbits, d_out, N);
+  check_cuda(cudaGetLastError(), "fp32 kernel launch");
+  check_cuda(cudaDeviceSynchronize(), "fp32 kernel sync");
+
+  check_cuda(cudaMemcpy(h_out.data(), d_out, N * sizeof(uint16_t), cudaMemcpyDeviceToHost), "D2H out");
+
+  int mismatches = 0;
+  for (int i = 0; i < N; ++i) {
+    if (h_out[i] != h_ref[i]) {
+      if (mismatches < 10)
+        printf("mismatch at %d: gpu=0x%04X cpu=0x%04X\n", i, h_out[i], h_ref[i]);
+      ++mismatches;
+    }
+  }
+
+  printf("N=%d mismatches=%d\n\n", N, mismatches);
+  if (mismatches != 0) exit(1);
+
+  cudaFree(d_in01); cudaFree(d_in23); cudaFree(d_rbits); cudaFree(d_out);
+}
+
+static void test_8x_cpu_gpu_consistency() {
+  printf("=== 8x BF16 CPU/GPU consistency ===\n");
+  constexpr int N = 20000;
+  std::mt19937 rng(67890);
+  std::uniform_real_distribution<float> dist(-8.0f, 8.0f);
+  std::uniform_int_distribution<uint32_t> dist_u32(0u, 0xFFFFFFFFu);
+
+  std::vector<uint64_t> h_in03(N), h_in47(N);
+  std::vector<uint32_t> h_rbits03(N), h_rbits47(N);
+  std::vector<uint32_t> h_out(N), h_ref(N);
+
+  const float scale = 0.75f;
+
+  for (int i = 0; i < N; ++i) {
+    h_in03[i] = pack_4_bf16(dist(rng), dist(rng), dist(rng), dist(rng));
+    h_in47[i] = pack_4_bf16(dist(rng), dist(rng), dist(rng), dist(rng));
+    h_rbits03[i] = dist_u32(rng);
+    h_rbits47[i] = dist_u32(rng);
+    h_ref[i] = cpu_reference_8x(h_in03[i], h_in47[i], scale, h_rbits03[i], h_rbits47[i]);
+  }
+
+  uint64_t *d_in03, *d_in47; uint32_t *d_rb03, *d_rb47, *d_out;
+  check_cuda(cudaMalloc(&d_in03, N * sizeof(uint64_t)), "malloc d_in03");
+  check_cuda(cudaMalloc(&d_in47, N * sizeof(uint64_t)), "malloc d_in47");
+  check_cuda(cudaMalloc(&d_rb03, N * sizeof(uint32_t)), "malloc d_rb03");
+  check_cuda(cudaMalloc(&d_rb47, N * sizeof(uint32_t)), "malloc d_rb47");
+  check_cuda(cudaMalloc(&d_out, N * sizeof(uint32_t)), "malloc d_out");
+
+  check_cuda(cudaMemcpy(d_in03, h_in03.data(), N * sizeof(uint64_t), cudaMemcpyHostToDevice), "H2D in03");
+  check_cuda(cudaMemcpy(d_in47, h_in47.data(), N * sizeof(uint64_t), cudaMemcpyHostToDevice), "H2D in47");
+  check_cuda(cudaMemcpy(d_rb03, h_rbits03.data(), N * sizeof(uint32_t), cudaMemcpyHostToDevice), "H2D rb03");
+  check_cuda(cudaMemcpy(d_rb47, h_rbits47.data(), N * sizeof(uint32_t), cudaMemcpyHostToDevice), "H2D rb47");
+
+  test_8x_kernel<<<(N + 255) / 256, 256>>>(d_in03, d_in47, scale, d_rb03, d_rb47, d_out, N);
+  check_cuda(cudaGetLastError(), "8x kernel launch");
+  check_cuda(cudaDeviceSynchronize(), "8x kernel sync");
+
+  check_cuda(cudaMemcpy(h_out.data(), d_out, N * sizeof(uint32_t), cudaMemcpyDeviceToHost), "D2H out");
+
+  int mismatches = 0;
+  for (int i = 0; i < N; ++i) {
+    if (h_out[i] != h_ref[i]) {
+      if (mismatches < 10)
+        printf("mismatch at %d: gpu=0x%08X cpu=0x%08X\n", i, h_out[i], h_ref[i]);
+      ++mismatches;
+    }
+  }
+
+  printf("N=%d mismatches=%d\n\n", N, mismatches);
+  if (mismatches != 0) exit(1);
+
+  cudaFree(d_in03); cudaFree(d_in47); cudaFree(d_rb03); cudaFree(d_rb47); cudaFree(d_out);
+}
+
 struct PerfStats {
   float ms = 0.0f;
   double groups_per_sec = 0.0;
@@ -505,6 +671,8 @@ int main() {
   test_saturation_and_specials();
   test_scale_semantics();
   test_cpu_gpu_consistency();
+  test_fp32_cpu_gpu_consistency();
+  test_8x_cpu_gpu_consistency();
   test_probability_suites();
   test_throughput();
   printf("All tests passed.\n");

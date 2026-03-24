@@ -289,6 +289,118 @@ __global__ void test_e2e_unbiasedness(
 }
 
 // ===================================================================
+// Test 8: E2E mul_cvt_fp32_to_fp4_4x_with_stochastic_rounding
+// ===================================================================
+
+__global__ void test_e2e_fp32_kernel(
+    const float2 *__restrict__ in01s,
+    const float2 *__restrict__ in23s,
+    const float2 *__restrict__ scales,
+    const uint32_t *__restrict__ rbits,
+    uint16_t *__restrict__ outputs,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    fp4e2m1x4 r = mul_cvt_fp32_to_fp4_4x_with_stochastic_rounding(
+        in01s[idx], in23s[idx], scales[idx], rbits[idx]);
+    outputs[idx] = r.__x;
+}
+
+__global__ void test_e2e_fp32_unbiasedness(
+    const float2 in01, const float2 in23, const float2 scale,
+    double *__restrict__ lane_sums,
+    int n_trials_per_val
+) {
+    curandState rng;
+    curand_init(271828u, threadIdx.x, 0, &rng);
+
+    double local_sums[4] = {0.0, 0.0, 0.0, 0.0};
+    int trials_per_thread = n_trials_per_val / blockDim.x;
+
+    for (int i = 0; i < trials_per_thread; i++) {
+        uint32_t rbits = curand(&rng);
+        fp4e2m1x4 r = mul_cvt_fp32_to_fp4_4x_with_stochastic_rounding(
+            in01, in23, scale, rbits);
+        uint16_t packed = r.__x;
+        for (int lane = 0; lane < 4; lane++) {
+            unsigned code = (packed >> (lane * 4)) & 0xFu;
+            local_sums[lane] += (double)e2m1_decode(code);
+        }
+    }
+
+    __shared__ double sdata[4][256];
+    for (int lane = 0; lane < 4; lane++)
+        sdata[lane][threadIdx.x] = local_sums[lane];
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s)
+            for (int lane = 0; lane < 4; lane++)
+                sdata[lane][threadIdx.x] += sdata[lane][threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+        for (int lane = 0; lane < 4; lane++)
+            atomicAdd(&lane_sums[lane], sdata[lane][0]);
+}
+
+// ===================================================================
+// Test 9: E2E mul_cvt_bf16_to_fp4_8x_stochastic_rounding
+// ===================================================================
+
+__global__ void test_e2e_8x_kernel(
+    const uint64_t *__restrict__ in03s,
+    const uint64_t *__restrict__ in47s,
+    const float *__restrict__ scales,
+    const uint32_t *__restrict__ rbits03s,
+    const uint32_t *__restrict__ rbits47s,
+    uint32_t *__restrict__ outputs,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    outputs[idx] = mul_cvt_bf16_to_fp4_8x_stochastic_rounding(
+        in03s[idx], in47s[idx], scales[idx], rbits03s[idx], rbits47s[idx]);
+}
+
+__global__ void test_e2e_8x_unbiasedness(
+    const uint64_t in03, const uint64_t in47, const float scale,
+    double *__restrict__ lane_sums,
+    int n_trials_per_val
+) {
+    curandState rng;
+    curand_init(161803u, threadIdx.x, 0, &rng);
+
+    double local_sums[8] = {};
+    int trials_per_thread = n_trials_per_val / blockDim.x;
+
+    for (int i = 0; i < trials_per_thread; i++) {
+        uint32_t rbits03 = curand(&rng);
+        uint32_t rbits47 = curand(&rng);
+        uint32_t packed = mul_cvt_bf16_to_fp4_8x_stochastic_rounding(
+            in03, in47, scale, rbits03, rbits47);
+        for (int lane = 0; lane < 8; lane++) {
+            unsigned code = (packed >> (lane * 4)) & 0xFu;
+            local_sums[lane] += (double)e2m1_decode(code);
+        }
+    }
+
+    __shared__ double sdata[8][256];
+    for (int lane = 0; lane < 8; lane++)
+        sdata[lane][threadIdx.x] = local_sums[lane];
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s)
+            for (int lane = 0; lane < 8; lane++)
+                sdata[lane][threadIdx.x] += sdata[lane][threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+        for (int lane = 0; lane < 8; lane++)
+            atomicAdd(&lane_sums[lane], sdata[lane][0]);
+}
+
+// ===================================================================
 // Benchmark kernel
 // ===================================================================
 // Each thread converts one group of 4 floats.
@@ -642,6 +754,247 @@ int main() {
                 if (!ok) unbias_fail++;
             }
             printf("  7d unbiasedness:         %s\n", unbias_fail == 0 ? "PASS" : "FAIL");
+            cudaFree(d_sums);
+        }
+    }
+
+    // ------ Test 8: E2E mul_cvt_fp32_to_fp4_4x_with_stochastic_rounding ------
+    {
+        printf("\n[Test 8] E2E mul_cvt_fp32_to_fp4_4x_with_stochastic_rounding:\n");
+
+        // 8a: Exact representable values with identity scale
+        // FP32 variant has same nibble mapping as BF16 variant:
+        //   nibble0 = in23.y*scale.y, nibble1 = in23.x*scale.x,
+        //   nibble2 = in01.y*scale.y, nibble3 = in01.x*scale.x
+        {
+            float2 h_in01 = make_float2(0.0f, 0.5f);
+            float2 h_in23 = make_float2(1.0f, 1.5f);
+            float2 h_sc   = make_float2(1.0f, 1.0f);
+            uint32_t h_rb  = 0xDEADBEEFu;
+
+            float2 *d_in01, *d_in23, *d_sc; uint32_t *d_rb; uint16_t *d_out;
+            CUDA_CHECK(cudaMalloc(&d_in01, sizeof(float2)));
+            CUDA_CHECK(cudaMalloc(&d_in23, sizeof(float2)));
+            CUDA_CHECK(cudaMalloc(&d_sc, sizeof(float2)));
+            CUDA_CHECK(cudaMalloc(&d_rb, sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc(&d_out, sizeof(uint16_t)));
+            CUDA_CHECK(cudaMemcpy(d_in01, &h_in01, sizeof(float2), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_in23, &h_in23, sizeof(float2), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_sc, &h_sc, sizeof(float2), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_rb, &h_rb, sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+            test_e2e_fp32_kernel<<<1, 1>>>(d_in01, d_in23, d_sc, d_rb, d_out, 1);
+
+            uint16_t h_out;
+            CUDA_CHECK(cudaMemcpy(&h_out, d_out, sizeof(uint16_t), cudaMemcpyDeviceToHost));
+
+            // nibble0=in23.y*sy=1.5, nibble1=in23.x*sx=1.0,
+            // nibble2=in01.y*sy=0.5, nibble3=in01.x*sx=0.0
+            float expect[] = {1.5f, 1.0f, 0.5f, 0.0f};
+            int fail = 0;
+            for (int lane = 0; lane < 4; lane++) {
+                float decoded = e2m1_decode((h_out >> (lane * 4)) & 0xFu);
+                if (decoded != expect[lane] && !(expect[lane] == 0.0f && decoded == 0.0f)) {
+                    printf("  FAIL 8a lane=%d: expected=%g got=%g\n", lane, expect[lane], decoded);
+                    fail++;
+                }
+            }
+            printf("  8a exact representables: %s\n", fail == 0 ? "PASS" : "FAIL");
+            cudaFree(d_in01); cudaFree(d_in23); cudaFree(d_sc); cudaFree(d_rb); cudaFree(d_out);
+        }
+
+        // 8b: Scale semantics
+        {
+            float2 h_in01 = make_float2(1.0f, 1.0f);
+            float2 h_in23 = make_float2(1.0f, 1.0f);
+            float2 h_sc   = make_float2(2.0f, 3.0f);
+            uint32_t h_rb  = 0x12345678u;
+
+            float2 *d_in01, *d_in23, *d_sc; uint32_t *d_rb; uint16_t *d_out;
+            CUDA_CHECK(cudaMalloc(&d_in01, sizeof(float2)));
+            CUDA_CHECK(cudaMalloc(&d_in23, sizeof(float2)));
+            CUDA_CHECK(cudaMalloc(&d_sc, sizeof(float2)));
+            CUDA_CHECK(cudaMalloc(&d_rb, sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc(&d_out, sizeof(uint16_t)));
+            CUDA_CHECK(cudaMemcpy(d_in01, &h_in01, sizeof(float2), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_in23, &h_in23, sizeof(float2), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_sc, &h_sc, sizeof(float2), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_rb, &h_rb, sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+            test_e2e_fp32_kernel<<<1, 1>>>(d_in01, d_in23, d_sc, d_rb, d_out, 1);
+
+            uint16_t h_out;
+            CUDA_CHECK(cudaMemcpy(&h_out, d_out, sizeof(uint16_t), cudaMemcpyDeviceToHost));
+
+            // nibble0=1*3=3, nibble1=1*2=2, nibble2=1*3=3, nibble3=1*2=2
+            float expect[] = {3.0f, 2.0f, 3.0f, 2.0f};
+            int fail = 0;
+            for (int lane = 0; lane < 4; lane++) {
+                float decoded = e2m1_decode((h_out >> (lane * 4)) & 0xFu);
+                if (decoded != expect[lane]) {
+                    printf("  FAIL 8b lane=%d: expected=%g got=%g\n", lane, expect[lane], decoded);
+                    fail++;
+                }
+            }
+            printf("  8b scale semantics:      %s\n", fail == 0 ? "PASS" : "FAIL");
+            cudaFree(d_in01); cudaFree(d_in23); cudaFree(d_sc); cudaFree(d_rb); cudaFree(d_out);
+        }
+
+        // 8c: Unbiasedness
+        {
+            float2 h_in01 = make_float2(0.7f, 1.3f);
+            float2 h_in23 = make_float2(-2.5f, 4.5f);
+            float2 h_sc   = make_float2(1.0f, 1.0f);
+            int n_trials = 256 * 10000;
+
+            double *d_sums;
+            CUDA_CHECK(cudaMalloc(&d_sums, 4 * sizeof(double)));
+            CUDA_CHECK(cudaMemset(d_sums, 0, 4 * sizeof(double)));
+
+            test_e2e_fp32_unbiasedness<<<1, 256>>>(h_in01, h_in23, h_sc, d_sums, n_trials);
+
+            double h_sums[4];
+            CUDA_CHECK(cudaMemcpy(h_sums, d_sums, 4 * sizeof(double), cudaMemcpyDeviceToHost));
+
+            // nibble0=in23.y=4.5, nibble1=in23.x=-2.5, nibble2=in01.y=1.3, nibble3=in01.x=0.7
+            float expect[] = {4.5f, -2.5f, 1.3f, 0.7f};
+            int fail = 0;
+            printf("  8c unbiasedness (FP32->FP4):\n");
+            for (int lane = 0; lane < 4; lane++) {
+                double mean = h_sums[lane] / (double)n_trials;
+                double err = fabs(mean - (double)expect[lane]);
+                bool ok = err < 0.02;
+                printf("    %+7.3f  E=%+11.6f  err=%10.6f  %s\n",
+                       expect[lane], mean, err, ok ? "OK" : "FAIL");
+                if (!ok) fail++;
+            }
+            printf("  8c unbiasedness:         %s\n", fail == 0 ? "PASS" : "FAIL");
+            cudaFree(d_sums);
+        }
+    }
+
+    // ------ Test 9: E2E mul_cvt_bf16_to_fp4_8x_stochastic_rounding ------
+    {
+        printf("\n[Test 9] E2E mul_cvt_bf16_to_fp4_8x_stochastic_rounding:\n");
+
+        // 9a: Exact representable values with identity scale
+        // 8x packing: b03={v3,v2,v1,v0} → nibble0=v3, nibble1=v2, nibble2=v1, nibble3=v0
+        //             b47={v7,v6,v5,v4} → nibble4=v7, nibble5=v6, nibble6=v5, nibble7=v4
+        // So nibbles are in reversed order within each group of 4.
+        {
+            float vals03[] = {0.0f, 0.5f, 1.0f, 1.5f};
+            float vals47[] = {2.0f, 3.0f, 4.0f, 6.0f};
+            uint64_t h_in03 = pack_4_bf16(vals03[0], vals03[1], vals03[2], vals03[3]);
+            uint64_t h_in47 = pack_4_bf16(vals47[0], vals47[1], vals47[2], vals47[3]);
+            float h_scale = 1.0f;
+            uint32_t h_rb03 = 0x11111111u, h_rb47 = 0x22222222u;
+
+            uint64_t *d_in03, *d_in47; float *d_sc; uint32_t *d_rb03, *d_rb47, *d_out;
+            CUDA_CHECK(cudaMalloc(&d_in03, sizeof(uint64_t)));
+            CUDA_CHECK(cudaMalloc(&d_in47, sizeof(uint64_t)));
+            CUDA_CHECK(cudaMalloc(&d_sc, sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&d_rb03, sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc(&d_rb47, sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc(&d_out, sizeof(uint32_t)));
+            CUDA_CHECK(cudaMemcpy(d_in03, &h_in03, sizeof(uint64_t), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_in47, &h_in47, sizeof(uint64_t), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_sc, &h_scale, sizeof(float), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_rb03, &h_rb03, sizeof(uint32_t), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_rb47, &h_rb47, sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+            test_e2e_8x_kernel<<<1, 1>>>(d_in03, d_in47, d_sc, d_rb03, d_rb47, d_out, 1);
+
+            uint32_t h_out;
+            CUDA_CHECK(cudaMemcpy(&h_out, d_out, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+            // Low 16 bits (b03): nibble0=bf16[3]=1.5, nibble1=bf16[2]=1.0,
+            //                     nibble2=bf16[1]=0.5, nibble3=bf16[0]=0.0
+            // High 16 bits (b47): nibble4=bf16[7]=6.0, nibble5=bf16[6]=4.0,
+            //                      nibble6=bf16[5]=3.0, nibble7=bf16[4]=2.0
+            float expect[] = {1.5f, 1.0f, 0.5f, 0.0f, 6.0f, 4.0f, 3.0f, 2.0f};
+            int fail = 0;
+            for (int lane = 0; lane < 8; lane++) {
+                float decoded = e2m1_decode((h_out >> (lane * 4)) & 0xFu);
+                if (decoded != expect[lane] && !(expect[lane] == 0.0f && decoded == 0.0f)) {
+                    printf("  FAIL 9a lane=%d: expected=%g got=%g\n", lane, expect[lane], decoded);
+                    fail++;
+                }
+            }
+            printf("  9a exact representables: %s\n", fail == 0 ? "PASS" : "FAIL");
+            cudaFree(d_in03); cudaFree(d_in47); cudaFree(d_sc);
+            cudaFree(d_rb03); cudaFree(d_rb47); cudaFree(d_out);
+        }
+
+        // 9b: Scale and saturation
+        {
+            uint64_t h_in03 = pack_4_bf16(1.0f, 1.0f, 1.0f, 1.0f);
+            uint64_t h_in47 = pack_4_bf16(1.0f, 1.0f, 1.0f, 1.0f);
+            float h_scale = 3.0f;  // all become 3.0, exact representable
+            uint32_t h_rb03 = 0xAAAAAAAAu, h_rb47 = 0x55555555u;
+
+            uint64_t *d_in03, *d_in47; float *d_sc; uint32_t *d_rb03, *d_rb47, *d_out;
+            CUDA_CHECK(cudaMalloc(&d_in03, sizeof(uint64_t)));
+            CUDA_CHECK(cudaMalloc(&d_in47, sizeof(uint64_t)));
+            CUDA_CHECK(cudaMalloc(&d_sc, sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&d_rb03, sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc(&d_rb47, sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc(&d_out, sizeof(uint32_t)));
+            CUDA_CHECK(cudaMemcpy(d_in03, &h_in03, sizeof(uint64_t), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_in47, &h_in47, sizeof(uint64_t), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_sc, &h_scale, sizeof(float), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_rb03, &h_rb03, sizeof(uint32_t), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_rb47, &h_rb47, sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+            test_e2e_8x_kernel<<<1, 1>>>(d_in03, d_in47, d_sc, d_rb03, d_rb47, d_out, 1);
+
+            uint32_t h_out;
+            CUDA_CHECK(cudaMemcpy(&h_out, d_out, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+            int fail = 0;
+            for (int lane = 0; lane < 8; lane++) {
+                float decoded = e2m1_decode((h_out >> (lane * 4)) & 0xFu);
+                if (decoded != 3.0f) {
+                    printf("  FAIL 9b lane=%d: expected=3 got=%g\n", lane, decoded);
+                    fail++;
+                }
+            }
+            printf("  9b scalar scale:         %s\n", fail == 0 ? "PASS" : "FAIL");
+            cudaFree(d_in03); cudaFree(d_in47); cudaFree(d_sc);
+            cudaFree(d_rb03); cudaFree(d_rb47); cudaFree(d_out);
+        }
+
+        // 9c: Unbiasedness across all 8 lanes
+        {
+            float vals03[] = {0.7f, 1.3f, -2.5f, 4.5f};
+            float vals47[] = {-0.3f, 1.7f, 3.5f, -5.0f};
+            uint64_t h_in03 = pack_4_bf16(vals03[0], vals03[1], vals03[2], vals03[3]);
+            uint64_t h_in47 = pack_4_bf16(vals47[0], vals47[1], vals47[2], vals47[3]);
+            float h_scale = 1.0f;
+            int n_trials = 256 * 10000;
+
+            double *d_sums;
+            CUDA_CHECK(cudaMalloc(&d_sums, 8 * sizeof(double)));
+            CUDA_CHECK(cudaMemset(d_sums, 0, 8 * sizeof(double)));
+
+            test_e2e_8x_unbiasedness<<<1, 256>>>(h_in03, h_in47, h_scale, d_sums, n_trials);
+
+            double h_sums[8];
+            CUDA_CHECK(cudaMemcpy(h_sums, d_sums, 8 * sizeof(double), cudaMemcpyDeviceToHost));
+
+            // b03: nibble0=bf16[3]=4.5, nibble1=bf16[2]=-2.5, nibble2=bf16[1]=1.3, nibble3=bf16[0]=0.7
+            // b47: nibble4=bf16[7]=-5.0, nibble5=bf16[6]=3.5, nibble6=bf16[5]=1.7, nibble7=bf16[4]=-0.3
+            float expect[] = {4.5f, -2.5f, 1.3f, 0.7f, -5.0f, 3.5f, 1.7f, -0.3f};
+            int fail = 0;
+            printf("  9c unbiasedness (8x BF16->FP4):\n");
+            for (int lane = 0; lane < 8; lane++) {
+                double mean = h_sums[lane] / (double)n_trials;
+                double err = fabs(mean - (double)expect[lane]);
+                bool ok = err < 0.02;
+                printf("    lane%d: %+7.3f  E=%+11.6f  err=%10.6f  %s\n",
+                       lane, expect[lane], mean, err, ok ? "OK" : "FAIL");
+                if (!ok) fail++;
+            }
+            printf("  9c unbiasedness:         %s\n", fail == 0 ? "PASS" : "FAIL");
             cudaFree(d_sums);
         }
     }

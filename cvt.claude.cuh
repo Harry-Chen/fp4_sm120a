@@ -148,3 +148,101 @@ unsigned short fp32x4_to_e2m1x4_sr(float a, float b, float c, float d,
     d = apply_sr_noise_e2m1(d, (rbits >> 24) & 0xFFu);
     return cvt_e2m1x4_rn(a, b, c, d);
 }
+
+// ===================================================================
+// FP32 input variant: drop-in replacement for
+// cvt.rs.satfinite.e2m1x4.f32 with float2 inputs and float2 scale
+// ===================================================================
+//
+// Original asm mapping for (in01, in23, scale):
+//   mul.f32x2 then swap on readback, then pack {v2, v3, v0, v1}
+//   Same shuffle as the BF16 variant, just without BF16->FP32 conversion.
+
+__device__ __forceinline__
+fp4e2m1x4 mul_cvt_fp32_to_fp4_4x_with_stochastic_rounding(
+    const float2 in01, const float2 in23, const float2 scale, const uint32_t rbits) {
+
+    float v0, v1, v2, v3;
+    asm volatile(
+        "{\n\t"
+        ".reg .b64  p01, p23;\n\t"
+        "mov.b64 p01, %4;\n\t"
+        "mov.b64 p23, %5;\n\t"
+        "mul.f32x2 p01, p01, %6;\n\t"
+        "mul.f32x2 p23, p23, %6;\n\t"
+        "mov.b64 {%1, %0}, p01;\n\t"
+        "mov.b64 {%3, %2}, p23;\n\t"
+        "}"
+        : "=f"(v0), "=f"(v1), "=f"(v2), "=f"(v3)
+        : "l"(reinterpret_cast<const uint64_t &>(in01)),
+          "l"(reinterpret_cast<const uint64_t &>(in23)),
+          "l"(reinterpret_cast<const uint64_t &>(scale))
+    );
+
+    // Software SR noise (same element ordering as BF16 variant)
+    v2 = apply_sr_noise_e2m1(v2, (rbits      ) & 0xFFu);
+    v3 = apply_sr_noise_e2m1(v3, (rbits >>  8) & 0xFFu);
+    v0 = apply_sr_noise_e2m1(v0, (rbits >> 16) & 0xFFu);
+    v1 = apply_sr_noise_e2m1(v1, (rbits >> 24) & 0xFFu);
+
+    unsigned short out_4x = cvt_e2m1x4_rn(v2, v3, v0, v1);
+
+    fp4e2m1x4 result;
+    result.__x = out_4x;
+    return result;
+}
+
+// ===================================================================
+// 8x BF16->FP4 with stochastic rounding and scalar scale
+// ===================================================================
+//
+// Original asm packs {v3, v2, v1, v0} for each group of 4:
+//   b03: nibble0=v3, nibble1=v2, nibble2=v1, nibble3=v0
+//   b47: nibble0=v7, nibble1=v6, nibble2=v5, nibble3=v4
+//   result = b03 | (b47 << 16)
+
+template <typename ScaleT>
+__device__ __forceinline__ uint32_t mul_cvt_bf16_to_fp4_8x_stochastic_rounding(
+    const uint64_t in03, const uint64_t in47, const ScaleT scaling_coefficient,
+    const uint32_t rbits03, const uint32_t rbits47) {
+
+    float scale_f = static_cast<float>(scaling_coefficient);
+
+    float v0, v1, v2, v3, v4, v5, v6, v7;
+    asm volatile(
+        "{\n\t"
+        ".reg .b16 b0, b1, b2, b3, b4, b5, b6, b7;\n\t"
+        "mov.b64 {b0, b1, b2, b3}, %8;\n\t"
+        "mov.b64 {b4, b5, b6, b7}, %9;\n\t"
+        "cvt.f32.bf16 %0, b0;\n\t"
+        "cvt.f32.bf16 %1, b1;\n\t"
+        "cvt.f32.bf16 %2, b2;\n\t"
+        "cvt.f32.bf16 %3, b3;\n\t"
+        "cvt.f32.bf16 %4, b4;\n\t"
+        "cvt.f32.bf16 %5, b5;\n\t"
+        "cvt.f32.bf16 %6, b6;\n\t"
+        "cvt.f32.bf16 %7, b7;\n\t"
+        "}"
+        : "=f"(v0), "=f"(v1), "=f"(v2), "=f"(v3),
+          "=f"(v4), "=f"(v5), "=f"(v6), "=f"(v7)
+        : "l"(in03), "l"(in47)
+    );
+
+    v0 *= scale_f; v1 *= scale_f; v2 *= scale_f; v3 *= scale_f;
+    v4 *= scale_f; v5 *= scale_f; v6 *= scale_f; v7 *= scale_f;
+
+    // SR noise + pack matching {v3, v2, v1, v0} element order
+    v3 = apply_sr_noise_e2m1(v3, (rbits03      ) & 0xFFu);
+    v2 = apply_sr_noise_e2m1(v2, (rbits03 >>  8) & 0xFFu);
+    v1 = apply_sr_noise_e2m1(v1, (rbits03 >> 16) & 0xFFu);
+    v0 = apply_sr_noise_e2m1(v0, (rbits03 >> 24) & 0xFFu);
+    unsigned short b03 = cvt_e2m1x4_rn(v3, v2, v1, v0);
+
+    v7 = apply_sr_noise_e2m1(v7, (rbits47      ) & 0xFFu);
+    v6 = apply_sr_noise_e2m1(v6, (rbits47 >>  8) & 0xFFu);
+    v5 = apply_sr_noise_e2m1(v5, (rbits47 >> 16) & 0xFFu);
+    v4 = apply_sr_noise_e2m1(v4, (rbits47 >> 24) & 0xFFu);
+    unsigned short b47 = cvt_e2m1x4_rn(v7, v6, v5, v4);
+
+    return (uint32_t)b03 | ((uint32_t)b47 << 16);
+}
