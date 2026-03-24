@@ -82,7 +82,7 @@ static uint8_t float_to_fp8_ue4m3_cpu(float val) {
     if (val <= 0.0f) return 0;
     if (isnan(val)) return 0x7F;
     val = fminf(val, 448.0f);
-    // Brute force: find nearest E4M3 value
+    // Round-to-nearest-even (matching GPU's cvt.rn.satfinite.e4m3x2.f32)
     uint8_t best = 0;
     float best_dist = fabsf(val);
     for (int bits = 1; bits < 127; bits++) {
@@ -91,6 +91,11 @@ static uint8_t float_to_fp8_ue4m3_cpu(float val) {
         if (dist < best_dist) {
             best = bits;
             best_dist = dist;
+        } else if (dist == best_dist) {
+            // Tie-breaking: prefer even mantissa LSB (bit 0 of encoding)
+            if ((bits & 1) == 0) {
+                best = bits;
+            }
         }
     }
     return best;
@@ -365,7 +370,15 @@ TestResult run_test(int M, int N, bool use_fast_math, bool use_sr, bool verbose)
         }
     }
 
-    // For fast-math mode, accept small mismatch rates (different FP8 rounding + approx reciprocal)
+    // Fast-math mode has inherent CPU-vs-GPU mismatches that cannot be eliminated:
+    //   1. WMMA uses FMA (fused multiply-add, no intermediate rounding) while
+    //      the CPU reference uses separate mul+add with intermediate rounding.
+    //      Without the BF16 round-trip (skipped in fast-math), these precision
+    //      differences persist and can push values across FP4/FP8 boundaries.
+    //   2. GPU fast-math uses __frcp_rn (1 ULP accurate reciprocal approximation)
+    //      while the CPU uses IEEE 754 exact division (0.5 ULP). The difference
+    //      is at most 0.5 ULP but can cause different FP4 rounding at boundaries.
+    // These are expected and accepted with a <2% tolerance.
     if (use_sr) {
         res.passed = true;
     } else if (use_fast_math) {
