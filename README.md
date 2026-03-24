@@ -1,8 +1,8 @@
-# FP4 E2M1 Stochastic Rounding Polyfill for SM120a
+# FP4 E2M1 Stochastic Rounding Polyfill for SM120 Family
 
 Kernel polyfill for `mul_cvt_bf16_to_fp4_4x_with_stochastic_rounding` on devices
 that lack the `cvt.rs.satfinite.e2m1x4.f32` PTX instruction — primarily the
-NVIDIA RTX 5090 (Blackwell, SM120a).
+NVIDIA RTX 5090 (Blackwell, SM120) and DGX Spark (SM121).
 
 ## Background
 
@@ -40,6 +40,8 @@ behavior:
    floor (`apply_sr_noise_e2m1`), so `P(round_up) = (|x| - |x_lo|) / ULP`
 3. Pack with two `cvt.rn.satfinite.e2m1x2.f32` calls, combined into a 16-bit result
 
+It can be built on `sm_120f, sm_120a, sm_121a`.
+
 ### `cvt.chatgpt.cuh` — Pure Software Quantization (with optional hardware path)
 
 Performs the full quantization in software using explicit bracket lookup and
@@ -54,6 +56,8 @@ threshold comparison:
 Also includes a gated hardware path (`ARCH_HAS_STOCHASTIC_ROUNDING=1`) using
 the original `cvt.rs.satfinite.e2m1x4.f32` for architectures that support it.
 
+It is pure software implementation and can be built on any CUDA architecture.
+
 ## E2M1 Format
 
 4-bit floating point with 1 sign bit, 2 exponent bits, 1 mantissa bit.
@@ -61,17 +65,18 @@ Representable values: {0, 0.5, 1, 1.5, 2, 3, 4, 6} (and their negatives).
 
 ## Building
 
-Requires CUDA toolkit with SM120a support (CUDA 12.8+).
+Requires CUDA toolkit with SM120 support (CUDA 12.8+).
 
 ```bash
 make            # builds cvt.claude.exe and cvt.chatgpt.exe
 make clean      # removes executables
 ```
 
-Set `CUDA_HOME` if your CUDA installation is not at `/usr/local/cuda`:
+Set `CUDA_ARCH` for a different CUDA architecture, and `CUDA_HOME` if
+your CUDA installation is not at `/usr/local/cuda`:
 
 ```bash
-make CUDA_HOME=/path/to/cuda
+make CUDA_HOME=/path/to/cuda CUDA_ARCH=121a
 ```
 
 ## Test Suites

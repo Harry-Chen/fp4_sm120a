@@ -1,6 +1,8 @@
 CUDA_HOME ?= /usr/local/cuda
+CUDA_ARCH ?= 120f
+
 NVCC := $(CUDA_HOME)/bin/nvcc
-NVCC_FLAGS := -gencode=arch=compute_120a,code=sm_120a -Xptxas=-v -O3 -std=c++20 -g
+NVCC_FLAGS := -gencode=arch=compute_$(CUDA_ARCH),code=sm_$(CUDA_ARCH) -Xptxas=-v -O3 -std=c++20 -g
 
 SRC := $(wildcard *.cu)
 EXE := $(SRC:%.cu=%.exe)
