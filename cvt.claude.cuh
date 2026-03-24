@@ -120,18 +120,10 @@ fp4e2m1x4 mul_cvt_bf16_to_fp4_4x_with_stochastic_rounding(
         : "l"(in_4x), "l"(reinterpret_cast<const uint64_t &>(scale))
     );
 
-    // Software SR noise (matches original element ordering)
-    v2 = apply_sr_noise_e2m1(v2, (rbits      ) & 0xFFu);
-    v3 = apply_sr_noise_e2m1(v3, (rbits >>  8) & 0xFFu);
-    v0 = apply_sr_noise_e2m1(v0, (rbits >> 16) & 0xFFu);
-    v1 = apply_sr_noise_e2m1(v1, (rbits >> 24) & 0xFFu);
-
     // Original: cvt.rs.satfinite.e2m1x4.f32 %0, {v2, v3, v0, v1}, rbits
     // Layout:   nibble0=v2, nibble1=v3, nibble2=v0, nibble3=v1
-    unsigned short out_4x = cvt_e2m1x4_rn(v2, v3, v0, v1);
-
     fp4e2m1x4 result;
-    result.__x = out_4x;
+    result.__x = fp32x4_to_e2m1x4_sr(v2, v3, v0, v1, rbits);
     return result;
 }
 
@@ -179,16 +171,8 @@ fp4e2m1x4 mul_cvt_fp32_to_fp4_4x_with_stochastic_rounding(
           "l"(reinterpret_cast<const uint64_t &>(scale))
     );
 
-    // Software SR noise (same element ordering as BF16 variant)
-    v2 = apply_sr_noise_e2m1(v2, (rbits      ) & 0xFFu);
-    v3 = apply_sr_noise_e2m1(v3, (rbits >>  8) & 0xFFu);
-    v0 = apply_sr_noise_e2m1(v0, (rbits >> 16) & 0xFFu);
-    v1 = apply_sr_noise_e2m1(v1, (rbits >> 24) & 0xFFu);
-
-    unsigned short out_4x = cvt_e2m1x4_rn(v2, v3, v0, v1);
-
     fp4e2m1x4 result;
-    result.__x = out_4x;
+    result.__x = fp32x4_to_e2m1x4_sr(v2, v3, v0, v1, rbits);
     return result;
 }
 
@@ -232,17 +216,8 @@ __device__ __forceinline__ uint32_t mul_cvt_bf16_to_fp4_8x_stochastic_rounding(
     v4 *= scale_f; v5 *= scale_f; v6 *= scale_f; v7 *= scale_f;
 
     // SR noise + pack matching {v3, v2, v1, v0} element order
-    v3 = apply_sr_noise_e2m1(v3, (rbits03      ) & 0xFFu);
-    v2 = apply_sr_noise_e2m1(v2, (rbits03 >>  8) & 0xFFu);
-    v1 = apply_sr_noise_e2m1(v1, (rbits03 >> 16) & 0xFFu);
-    v0 = apply_sr_noise_e2m1(v0, (rbits03 >> 24) & 0xFFu);
-    unsigned short b03 = cvt_e2m1x4_rn(v3, v2, v1, v0);
-
-    v7 = apply_sr_noise_e2m1(v7, (rbits47      ) & 0xFFu);
-    v6 = apply_sr_noise_e2m1(v6, (rbits47 >>  8) & 0xFFu);
-    v5 = apply_sr_noise_e2m1(v5, (rbits47 >> 16) & 0xFFu);
-    v4 = apply_sr_noise_e2m1(v4, (rbits47 >> 24) & 0xFFu);
-    unsigned short b47 = cvt_e2m1x4_rn(v7, v6, v5, v4);
+    unsigned short b03 = fp32x4_to_e2m1x4_sr(v3, v2, v1, v0, rbits03);
+    unsigned short b47 = fp32x4_to_e2m1x4_sr(v7, v6, v5, v4, rbits47);
 
     return (uint32_t)b03 | ((uint32_t)b47 << 16);
 }

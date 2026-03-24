@@ -132,6 +132,19 @@ static inline __host__ __device__ uint8_t quantize_fp32_to_fp4_e2m1_sr(float x, 
   return pack_fp4_e2m1(neg, chosen);
 }
 
+// ===================================================================
+// Standalone FP32x4 -> FP4 nibbles with stochastic rounding
+// ===================================================================
+
+static inline __host__ __device__ uint16_t fp32x4_to_fp4_nibbles_sr(
+    float v0, float v1, float v2, float v3, uint32_t rbits) {
+  const uint8_t q0 = quantize_fp32_to_fp4_e2m1_sr(v0, mix_lane_bits(rbits, 0));
+  const uint8_t q1 = quantize_fp32_to_fp4_e2m1_sr(v1, mix_lane_bits(rbits, 1));
+  const uint8_t q2 = quantize_fp32_to_fp4_e2m1_sr(v2, mix_lane_bits(rbits, 2));
+  const uint8_t q3 = quantize_fp32_to_fp4_e2m1_sr(v3, mix_lane_bits(rbits, 3));
+  return pack_4_fp4_nibbles(q0, q1, q2, q3);
+}
+
 __device__ __forceinline__ fp4e2m1x4 mul_cvt_bf16_to_fp4_4x_with_stochastic_rounding(
     const uint64_t in_4x, const float2 scale, const uint32_t rbits) {
   uint16_t out_4x = 0;
@@ -166,17 +179,12 @@ __device__ __forceinline__ fp4e2m1x4 mul_cvt_bf16_to_fp4_4x_with_stochastic_roun
         : "=h"(out_4x)
         : "l"(in_4x), "l"(reinterpret_cast<const uint64_t &>(scale)), "r"(rbits));
   } else {
-    const float v0 = bf16_bits_to_float(get_bf16_lane(in_4x, 0)) * scale.x;
-    const float v1 = bf16_bits_to_float(get_bf16_lane(in_4x, 1)) * scale.y;
-    const float v2 = bf16_bits_to_float(get_bf16_lane(in_4x, 2)) * scale.x;
-    const float v3 = bf16_bits_to_float(get_bf16_lane(in_4x, 3)) * scale.y;
-
-    const uint8_t q0 = quantize_fp32_to_fp4_e2m1_sr(v0, mix_lane_bits(rbits, 0));
-    const uint8_t q1 = quantize_fp32_to_fp4_e2m1_sr(v1, mix_lane_bits(rbits, 1));
-    const uint8_t q2 = quantize_fp32_to_fp4_e2m1_sr(v2, mix_lane_bits(rbits, 2));
-    const uint8_t q3 = quantize_fp32_to_fp4_e2m1_sr(v3, mix_lane_bits(rbits, 3));
-
-    out_4x = pack_4_fp4_nibbles(q0, q1, q2, q3);
+    out_4x = fp32x4_to_fp4_nibbles_sr(
+        bf16_bits_to_float(get_bf16_lane(in_4x, 0)) * scale.x,
+        bf16_bits_to_float(get_bf16_lane(in_4x, 1)) * scale.y,
+        bf16_bits_to_float(get_bf16_lane(in_4x, 2)) * scale.x,
+        bf16_bits_to_float(get_bf16_lane(in_4x, 3)) * scale.y,
+        rbits);
   }
 
   return make_fp4e2m1x4(out_4x);
@@ -215,17 +223,10 @@ __device__ __forceinline__ fp4e2m1x4 mul_cvt_fp32_to_fp4_4x_with_stochastic_roun
           "l"(reinterpret_cast<const uint64_t &>(in23)),
           "l"(reinterpret_cast<const uint64_t &>(scale)), "r"(rbits));
   } else {
-    const float v0 = in01.x * scale.x;
-    const float v1 = in01.y * scale.y;
-    const float v2 = in23.x * scale.x;
-    const float v3 = in23.y * scale.y;
-
-    const uint8_t q0 = quantize_fp32_to_fp4_e2m1_sr(v0, mix_lane_bits(rbits, 0));
-    const uint8_t q1 = quantize_fp32_to_fp4_e2m1_sr(v1, mix_lane_bits(rbits, 1));
-    const uint8_t q2 = quantize_fp32_to_fp4_e2m1_sr(v2, mix_lane_bits(rbits, 2));
-    const uint8_t q3 = quantize_fp32_to_fp4_e2m1_sr(v3, mix_lane_bits(rbits, 3));
-
-    out_4x = pack_4_fp4_nibbles(q0, q1, q2, q3);
+    out_4x = fp32x4_to_fp4_nibbles_sr(
+        in01.x * scale.x, in01.y * scale.y,
+        in23.x * scale.x, in23.y * scale.y,
+        rbits);
   }
 
   return make_fp4e2m1x4(out_4x);
@@ -279,26 +280,18 @@ __device__ __forceinline__ uint32_t mul_cvt_bf16_to_fp4_8x_stochastic_rounding(
   } else {
     const float scale_f = static_cast<float>(scaling_coefficient);
 
-    const float v0 = bf16_bits_to_float(get_bf16_lane(in03, 0)) * scale_f;
-    const float v1 = bf16_bits_to_float(get_bf16_lane(in03, 1)) * scale_f;
-    const float v2 = bf16_bits_to_float(get_bf16_lane(in03, 2)) * scale_f;
-    const float v3 = bf16_bits_to_float(get_bf16_lane(in03, 3)) * scale_f;
-    const float v4 = bf16_bits_to_float(get_bf16_lane(in47, 0)) * scale_f;
-    const float v5 = bf16_bits_to_float(get_bf16_lane(in47, 1)) * scale_f;
-    const float v6 = bf16_bits_to_float(get_bf16_lane(in47, 2)) * scale_f;
-    const float v7 = bf16_bits_to_float(get_bf16_lane(in47, 3)) * scale_f;
-
-    const uint8_t q0 = quantize_fp32_to_fp4_e2m1_sr(v0, mix_lane_bits(rbits03, 0));
-    const uint8_t q1 = quantize_fp32_to_fp4_e2m1_sr(v1, mix_lane_bits(rbits03, 1));
-    const uint8_t q2 = quantize_fp32_to_fp4_e2m1_sr(v2, mix_lane_bits(rbits03, 2));
-    const uint8_t q3 = quantize_fp32_to_fp4_e2m1_sr(v3, mix_lane_bits(rbits03, 3));
-    const uint8_t q4 = quantize_fp32_to_fp4_e2m1_sr(v4, mix_lane_bits(rbits47, 0));
-    const uint8_t q5 = quantize_fp32_to_fp4_e2m1_sr(v5, mix_lane_bits(rbits47, 1));
-    const uint8_t q6 = quantize_fp32_to_fp4_e2m1_sr(v6, mix_lane_bits(rbits47, 2));
-    const uint8_t q7 = quantize_fp32_to_fp4_e2m1_sr(v7, mix_lane_bits(rbits47, 3));
-
-    const uint16_t lo = pack_4_fp4_nibbles(q0, q1, q2, q3);
-    const uint16_t hi = pack_4_fp4_nibbles(q4, q5, q6, q7);
+    const uint16_t lo = fp32x4_to_fp4_nibbles_sr(
+        bf16_bits_to_float(get_bf16_lane(in03, 0)) * scale_f,
+        bf16_bits_to_float(get_bf16_lane(in03, 1)) * scale_f,
+        bf16_bits_to_float(get_bf16_lane(in03, 2)) * scale_f,
+        bf16_bits_to_float(get_bf16_lane(in03, 3)) * scale_f,
+        rbits03);
+    const uint16_t hi = fp32x4_to_fp4_nibbles_sr(
+        bf16_bits_to_float(get_bf16_lane(in47, 0)) * scale_f,
+        bf16_bits_to_float(get_bf16_lane(in47, 1)) * scale_f,
+        bf16_bits_to_float(get_bf16_lane(in47, 2)) * scale_f,
+        bf16_bits_to_float(get_bf16_lane(in47, 3)) * scale_f,
+        rbits47);
     out_8x = (uint32_t)lo | ((uint32_t)hi << 16);
   }
 
