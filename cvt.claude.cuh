@@ -3,11 +3,18 @@
 #include <cstdint>
 
 // ===================================================================
-// Type stub — replace with your actual fp4e2m1x4 definition
+// FP4 E2M1 types — use NVIDIA native types when available
 // ===================================================================
+#if FP4_TYPE_SUPPORTED
+#include <cuda_fp4.h>
+using fp4e2m1   = __nv_fp4_e2m1;
+using fp4e2m1x2 = __nv_fp4x2_e2m1;
+using fp4e2m1x4 = __nv_fp4x4_e2m1;
+#else
 struct fp4e2m1x4 {
-    uint16_t data;
+    uint16_t __x;
 };
+#endif
 
 // ===================================================================
 // E2M1 SR noise injection
@@ -123,7 +130,7 @@ fp4e2m1x4 mul_cvt_bf16_to_fp4_4x_with_stochastic_rounding(
     unsigned short out_4x = cvt_e2m1x4_rn(v2, v3, v0, v1);
 
     fp4e2m1x4 result;
-    result.data = out_4x;
+    result.__x = out_4x;
     return result;
 }
 

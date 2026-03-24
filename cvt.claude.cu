@@ -244,7 +244,7 @@ __global__ void test_e2e_kernel(
     if (idx >= n) return;
     fp4e2m1x4 r = mul_cvt_bf16_to_fp4_4x_with_stochastic_rounding(
         inputs[idx], scales[idx], rbits[idx]);
-    outputs[idx] = r.data;
+    outputs[idx] = r.__x;
 }
 
 __global__ void test_e2e_unbiasedness(
@@ -263,7 +263,7 @@ __global__ void test_e2e_unbiasedness(
         uint32_t rbits = curand(&rng);
         fp4e2m1x4 r = mul_cvt_bf16_to_fp4_4x_with_stochastic_rounding(
             in_4x, scale, rbits);
-        uint16_t packed = r.data;
+        uint16_t packed = r.__x;
         for (int lane = 0; lane < 4; lane++) {
             unsigned code = (packed >> (lane * 4)) & 0xFu;
             local_sums[lane] += (double)e2m1_decode(code);
@@ -469,12 +469,21 @@ int main() {
         printf("\n[Test 7] E2E mul_cvt_bf16_to_fp4_4x_with_stochastic_rounding:\n");
 
         // 7a: Exact representable values with identity scale
+        //
+        // The internal asm mapping for pack_4_bf16(a,b,c,d), scale=(sx,sy):
+        //   nibble0 = d*sy, nibble1 = c*sx, nibble2 = b*sy, nibble3 = a*sx
+        // With scale=(1,1) this is just: nibble0=d, nibble1=c, nibble2=b, nibble3=a
         {
-            // Pack exact E2M1 values as BF16, scale=1.0
             const float exact_sets[][4] = {
                 {0.0f, 0.5f, 1.0f, 1.5f},
                 {2.0f, 3.0f, 4.0f, 6.0f},
                 {-0.5f, -1.0f, -2.0f, -6.0f},
+            };
+            // Expected nibble order: {d, c, b, a} (reversed)
+            const float expect_sets[][4] = {
+                {1.5f, 1.0f, 0.5f, 0.0f},
+                {6.0f, 4.0f, 3.0f, 2.0f},
+                {-6.0f, -2.0f, -1.0f, -0.5f},
             };
             int n_sets = 3;
             uint64_t h_inputs[3];
@@ -505,7 +514,7 @@ int main() {
             for (int i = 0; i < n_sets; i++) {
                 for (int lane = 0; lane < 4; lane++) {
                     float decoded = e2m1_decode((h_out[i] >> (lane * 4)) & 0xFu);
-                    float expected = exact_sets[i][lane];
+                    float expected = expect_sets[i][lane];
                     if (decoded != expected && !(expected == 0.0f && decoded == 0.0f)) {
                         printf("  FAIL set=%d lane=%d: expected=%g got=%g\n",
                                i, lane, expected, decoded);
@@ -517,10 +526,10 @@ int main() {
             cudaFree(d_in); cudaFree(d_sc); cudaFree(d_rb); cudaFree(d_out);
         }
 
-        // 7b: Scale semantics — scale.x applies to lanes 0,2; scale.y to lanes 1,3
+        // 7b: Scale semantics
+        //   pack_4_bf16(a,b,c,d), scale=(sx,sy):
+        //     nibble0 = d*sy, nibble1 = c*sx, nibble2 = b*sy, nibble3 = a*sx
         {
-            // Input: all 1.0 BF16, scale=(2.0, 3.0)
-            // Expected: lanes 0,2 = 2.0, lanes 1,3 = 3.0
             uint64_t h_in = pack_4_bf16(1.0f, 1.0f, 1.0f, 1.0f);
             float2 h_sc = make_float2(2.0f, 3.0f);
             uint32_t h_rb = 0x12345678u;
@@ -539,17 +548,13 @@ int main() {
             uint16_t h_out;
             CUDA_CHECK(cudaMemcpy(&h_out, d_out, sizeof(uint16_t), cudaMemcpyDeviceToHost));
 
-            // Decode and check: the mul_cvt function applies scale via mul.f32x2 on
-            // pairs, then swaps ordering. Check the output matches expected values.
             float decoded[4];
             for (int lane = 0; lane < 4; lane++)
                 decoded[lane] = e2m1_decode((h_out >> (lane * 4)) & 0xFu);
 
-            // The internal asm does: v0=bf16[0]*scale.x, v1=bf16[1]*scale.y,
-            //                        v2=bf16[2]*scale.x, v3=bf16[3]*scale.y
-            // then packs as nibbles: {v2, v3, v0, v1}
-            // So nibble0=v2=scale.x, nibble1=v3=scale.y, nibble2=v0=scale.x, nibble3=v1=scale.y
-            float expect_lane[] = {2.0f, 3.0f, 2.0f, 3.0f};
+            // nibble0 = d*sy = 1*3 = 3, nibble1 = c*sx = 1*2 = 2,
+            // nibble2 = b*sy = 1*3 = 3, nibble3 = a*sx = 1*2 = 2
+            float expect_lane[] = {3.0f, 2.0f, 3.0f, 2.0f};
             int scale_fail = 0;
             for (int lane = 0; lane < 4; lane++) {
                 if (decoded[lane] != expect_lane[lane]) {
@@ -563,9 +568,13 @@ int main() {
         }
 
         // 7c: Saturation through the full pipeline
+        //   nibble0 = d*sy, nibble1 = c*sx, nibble2 = b*sy, nibble3 = a*sx
+        //   scale = (100, -100)
+        //   nibble0 = 1*(-100) -> -6, nibble1 = 1*100 -> +6,
+        //   nibble2 = 1*(-100) -> -6, nibble3 = 1*100 -> +6
         {
             uint64_t h_in = pack_4_bf16(1.0f, 1.0f, 1.0f, 1.0f);
-            float2 h_sc = make_float2(100.0f, -100.0f);  // will saturate to +/-6.0
+            float2 h_sc = make_float2(100.0f, -100.0f);
             uint32_t h_rb = 0xAAAAAAAAu;
 
             uint64_t *d_in; float2 *d_sc; uint32_t *d_rb; uint16_t *d_out;
@@ -582,10 +591,7 @@ int main() {
             uint16_t h_out;
             CUDA_CHECK(cudaMemcpy(&h_out, d_out, sizeof(uint16_t), cudaMemcpyDeviceToHost));
 
-            // nibble layout: {v2, v3, v0, v1}
-            // v0=1.0*100=100  -> +6.0   v1=1.0*(-100)=-100 -> -6.0
-            // v2=1.0*100=100  -> +6.0   v3=1.0*(-100)=-100 -> -6.0
-            float expect_lane[] = {6.0f, -6.0f, 6.0f, -6.0f};
+            float expect_lane[] = {-6.0f, 6.0f, -6.0f, 6.0f};
             float decoded[4];
             for (int lane = 0; lane < 4; lane++)
                 decoded[lane] = e2m1_decode((h_out >> (lane * 4)) & 0xFu);
@@ -603,9 +609,10 @@ int main() {
         }
 
         // 7d: Unbiasedness through the full BF16->FP4 pipeline
+        //   pack_4_bf16(a,b,c,d), scale=(sx,sy):
+        //     nibble0 = d*sy, nibble1 = c*sx, nibble2 = b*sy, nibble3 = a*sx
+        //   With scale=(1,1): nibble0=d, nibble1=c, nibble2=b, nibble3=a
         {
-            // Input: 4 non-representable values as BF16, scale=1.0
-            // Check E[SR(x)] ~ x for each lane
             float vals[] = {0.7f, 1.3f, -2.5f, 4.5f};
             uint64_t h_in = pack_4_bf16(vals[0], vals[1], vals[2], vals[3]);
             float2 h_sc = make_float2(1.0f, 1.0f);
@@ -620,21 +627,16 @@ int main() {
             double h_sums[4];
             CUDA_CHECK(cudaMemcpy(h_sums, d_sums, 4 * sizeof(double), cudaMemcpyDeviceToHost));
 
-            // The nibble layout is {v2, v3, v0, v1}, so:
-            //   lane 0 = v2 = vals[2]*scale.x = -2.5
-            //   lane 1 = v3 = vals[3]*scale.y = 4.5
-            //   lane 2 = v0 = vals[0]*scale.x = 0.7
-            //   lane 3 = v1 = vals[1]*scale.y = 1.3
-            float expect_lane[] = {-2.5f, 4.5f, 0.7f, 1.3f};
+            // nibble0=d=4.5, nibble1=c=-2.5, nibble2=b=1.3, nibble3=a=0.7
+            float expect_lane[] = {4.5f, -2.5f, 1.3f, 0.7f};
             int unbias_fail = 0;
             printf("  7d unbiasedness (E2E BF16->FP4):\n");
             printf("    %-8s  %-12s  %-12s  %s\n", "expect", "E[SR(x)]", "error", "Status");
             for (int lane = 0; lane < 4; lane++) {
                 double mean = h_sums[lane] / (double)n_trials;
                 double err = fabs(mean - (double)expect_lane[lane]);
-                // 4.5 saturates to 6.0, so skip strict check for that lane
-                bool saturates = (fabsf(expect_lane[lane]) > 6.0f);
-                bool ok = saturates || err < 0.02;
+                // 4.5 is within E2M1 range (max=6.0), all values should be unbiased
+                bool ok = err < 0.02;
                 printf("    %+7.3f  %+11.6f  %10.6f   %s\n",
                        expect_lane[lane], mean, err, ok ? "OK" : "FAIL");
                 if (!ok) unbias_fail++;

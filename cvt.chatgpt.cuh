@@ -8,18 +8,28 @@
 #define ARCH_HAS_STOCHASTIC_ROUNDING 0
 #endif
 
+// ===================================================================
+// FP4 E2M1 types — use NVIDIA native types when available
+// ===================================================================
+#if FP4_TYPE_SUPPORTED
+#include <cuda_fp4.h>
+using fp4e2m1   = __nv_fp4_e2m1;
+using fp4e2m1x2 = __nv_fp4x2_e2m1;
+using fp4e2m1x4 = __nv_fp4x4_e2m1;
+#else
 struct fp4e2m1x4 {
-  uint16_t storage;
+  uint16_t __x;
 };
+#endif
 
 static inline __host__ __device__ fp4e2m1x4 make_fp4e2m1x4(uint16_t x) {
   fp4e2m1x4 out;
-  out.storage = x;
+  out.__x = x;
   return out;
 }
 
 static inline __host__ __device__ uint16_t raw_bits(fp4e2m1x4 x) {
-  return x.storage;
+  return x.__x;
 }
 
 static inline __host__ __device__ float fp4_e2m1_code_to_abs_float(uint8_t mag_code) {
