@@ -141,7 +141,7 @@ rht_gemm_kernel(
     extern __shared__ char smem_raw[];
     __nv_bfloat16* smem_A = reinterpret_cast<__nv_bfloat16*>(smem_raw);
     __nv_bfloat16* smem_B = smem_A + TILE_M * TILE_N;
-    float* smem_C = reinterpret_cast<float*>(smem_B + TILE_N * TILE_N);
+    float* smem_result = reinterpret_cast<float*>(smem_B + TILE_N * TILE_N);
 
     // --- Load B (16x16, row-major) once ---
     for (int i = threadIdx.x; i < TILE_N * TILE_N; i += THREADS_PER_BLOCK) {
@@ -192,7 +192,7 @@ rht_gemm_kernel(
         mma_sync(c_frag, a_frag, b_frag, c_frag);
 
         // Store WMMA result to shared memory (row-major)
-        float* warp_result = smem_C + warp_id * 16 * 16;
+        float* warp_result = smem_result + warp_id * 16 * 16;
         store_matrix_sync(warp_result, c_frag, 16, mem_row_major);
 
         // --- Quantize: FP32 → FP4 with per-16-element SFC ---
