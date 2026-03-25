@@ -14,7 +14,7 @@ instructions that are not all available on the SM120 family:
 |-------------|-------|-------|--------|
 | `cvt.rs.satfinite.e2m1x4.f32` | Yes | **No** | Polyfilled in `stochastic_rounding/` |
 | `cvt.rn.satfinite.e2m1x2.f32` | Yes | Yes | Used by polyfill |
-| RHT GEMM (Random Hadamard Transform) | SM100 kernel | Needs porting | Planned in `rht_gemm/` |
+| RHT GEMM (Random Hadamard Transform) | SM100 UMMA/tcgen05 | WMMA polyfill | Done in `rht_gemm/` |
 
 ## Components
 
@@ -39,10 +39,13 @@ match for the SM120 polyfill, statistical equivalence for the software polyfill.
 
 See [`stochastic_rounding/README.md`](stochastic_rounding/README.md) for details.
 
-### [`rht_gemm/`](rht_gemm/) — Planned
+### [`rht_gemm/`](rht_gemm/) — Done
 
-Random Hadamard Transform GEMM kernel for SM120. Required by Transformer
-Engine's FP4 recipe to apply the Hadamard rotation before quantization.
+Drop-in replacement for Transformer Engine's `rht_gemm_ntt_w_sfc` (Random
+Hadamard Transform GEMM) using WMMA instead of SM100's UMMA/tcgen05.
+
+Validated against native SM100 TE reference on GB300 — **0% mismatch** on both
+FP4 output and SFC scale factors across all tested sizes (256×128 to 8192×5120).
 
 ## Building
 
@@ -52,8 +55,14 @@ Each component has its own Makefile. See the README in each subdirectory.
 # Build stochastic rounding tests (SM120)
 cd stochastic_rounding && make
 
-# Build comparison test (requires SM100 hardware)
+# Build stochastic rounding comparison test (requires SM100 hardware)
 cd stochastic_rounding && make compare.exe CUDA_ARCH=100a
+
+# Build RHT GEMM correctness test (SM120)
+cd rht_gemm && make
+
+# Build RHT GEMM comparison test vs TE reference (requires SM100 hardware)
+cd rht_gemm && make test_compare.exe
 ```
 
 ## License
