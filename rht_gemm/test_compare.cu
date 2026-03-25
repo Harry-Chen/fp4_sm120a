@@ -43,6 +43,39 @@ static uint8_t get_nibble(const uint8_t* data, int idx) {
     return (idx % 2 == 0) ? (data[idx / 2] & 0xF) : (data[idx / 2] >> 4);
 }
 
+// Benchmark a kernel: warmup + timed runs, returns average milliseconds.
+static float benchmark_kernel(
+    void (*fn)(int, int, const __nv_bfloat16*, const __nv_bfloat16*,
+               uint8_t*, uint8_t*, const float*, const size_t*, uint32_t, cudaStream_t),
+    int M, int N,
+    const __nv_bfloat16* d_A, const __nv_bfloat16* d_B,
+    uint8_t* d_C, uint8_t* d_SFC,
+    const float* d_amax, const size_t* d_rng,
+    uint32_t sm_count)
+{
+    constexpr int WARMUP = 10;
+    constexpr int RUNS   = 50;
+
+    for (int i = 0; i < WARMUP; i++)
+        fn(M, N, d_A, d_B, d_C, d_SFC, d_amax, d_rng, sm_count, 0);
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    cudaEvent_t t0, t1;
+    CHECK_CUDA(cudaEventCreate(&t0));
+    CHECK_CUDA(cudaEventCreate(&t1));
+    CHECK_CUDA(cudaEventRecord(t0));
+    for (int i = 0; i < RUNS; i++)
+        fn(M, N, d_A, d_B, d_C, d_SFC, d_amax, d_rng, sm_count, 0);
+    CHECK_CUDA(cudaEventRecord(t1));
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    float ms;
+    CHECK_CUDA(cudaEventElapsedTime(&ms, t0, t1));
+    CHECK_CUDA(cudaEventDestroy(t0));
+    CHECK_CUDA(cudaEventDestroy(t1));
+    return ms / RUNS;
+}
+
 bool run_comparison(int M, int N) {
     printf("--- %d x %d ---\n", M, N);
 
@@ -89,11 +122,10 @@ bool run_comparison(int M, int N) {
     CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
     uint32_t sm_count = prop.multiProcessorCount;
 
-    printf("  Running our SM120 kernel...\n");
+    // ---- Correctness comparison ----
+    printf("  Correctness check...\n");
     run_ours(M, N, d_A, d_B, d_C_ours, d_SFC_ours, d_amax, d_rng, sm_count, 0);
     CHECK_CUDA(cudaDeviceSynchronize());
-
-    printf("  Running TE SM100 reference...\n");
     run_ref(M, N, d_A, d_B, d_C_ref, d_SFC_ref, d_amax, d_rng, sm_count, 0);
     CHECK_CUDA(cudaDeviceSynchronize());
 
@@ -129,7 +161,34 @@ bool run_comparison(int M, int N) {
     printf("  FP4: %d / %d mismatches (%.4f%%)\n", fp4_mm, M * N,
            M * N ? 100.0 * fp4_mm / (M * N) : 0.0);
     bool ok = (fp4_mm == 0 && sfc_mm == 0);
-    printf("  Result: %s\n\n", ok ? "MATCH" : "MISMATCH");
+    printf("  Correctness: %s\n", ok ? "MATCH" : "MISMATCH");
+
+    // ---- Performance benchmark (only if correctness passes) ----
+    if (ok) {
+        float ms_ours = benchmark_kernel(run_ours, M, N, d_A, d_B,
+                                         d_C_ours, d_SFC_ours, d_amax, d_rng, sm_count);
+        float ms_ref  = benchmark_kernel(run_ref,  M, N, d_A, d_B,
+                                         d_C_ref,  d_SFC_ref,  d_amax, d_rng, sm_count);
+
+        // FLOP count: N/16 independent 16x16 matmuls per row, M rows.
+        // Each 16x16 matmul = 2*16*16*16 = 8192 FLOP (FMA counted as 2).
+        double flops = 2.0 * M * N * 16;
+        double gflops_ours = flops / (ms_ours * 1e-3) / 1e9;
+        double gflops_ref  = flops / (ms_ref  * 1e-3) / 1e9;
+
+        // Effective bandwidth: read A (BF16) + write C (FP4) + write SFC (FP8)
+        double bytes = (double)M * N * 2 + (double)M * N / 2 + (double)M * (N / 16) + 512;
+        double bw_ours = bytes / (ms_ours * 1e-3) / 1e9;
+        double bw_ref  = bytes / (ms_ref  * 1e-3) / 1e9;
+
+        printf("  Performance:\n");
+        printf("    Ours (WMMA):  %8.3f ms  %8.1f GFLOPS  %8.1f GB/s\n",
+               ms_ours, gflops_ours, bw_ours);
+        printf("    Ref  (UMMA):  %8.3f ms  %8.1f GFLOPS  %8.1f GB/s\n",
+               ms_ref, gflops_ref, bw_ref);
+        printf("    Speedup: %.2fx\n", ms_ref / ms_ours);
+    }
+    printf("\n");
 
     CHECK_CUDA(cudaFree(d_A));
     CHECK_CUDA(cudaFree(d_B));
