@@ -282,6 +282,29 @@ int main() {
         for (auto& v : A) v = __float2bfloat16(1.0f);
     }, 0.001f);
 
+    extreme("contains_inf", [&](auto& A) {
+        uint16_t pos_inf = 0x7F80, neg_inf = 0xFF80;
+        for (int i = 0; i < EM * EN; i++) {
+            if (gen() % 256 == 0) {
+                uint16_t bits = (gen() % 2) ? pos_inf : neg_inf;
+                A[i] = *reinterpret_cast<__nv_bfloat16*>(&bits);
+            } else {
+                A[i] = __float2bfloat16(std::normal_distribution<float>(0, 1)(gen));
+            }
+        }
+    }, 4.0f);
+
+    extreme("contains_nan", [&](auto& A) {
+        uint16_t nan_bits = 0x7FC0;
+        for (int i = 0; i < EM * EN; i++) {
+            if (gen() % 256 == 0) {
+                A[i] = *reinterpret_cast<__nv_bfloat16*>(&nan_bits);
+            } else {
+                A[i] = __float2bfloat16(std::normal_distribution<float>(0, 1)(gen));
+            }
+        }
+    }, 4.0f);
+
     printf("\n=== %d / %d tests matched ===\n", pass, total);
     return (pass == total) ? 0 : 1;
 }
