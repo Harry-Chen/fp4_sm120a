@@ -76,20 +76,36 @@ static float benchmark_kernel(
     return ms / RUNS;
 }
 
-bool run_comparison(int M, int N) {
-    printf("--- %d x %d ---\n", M, N);
-
-    std::mt19937 gen(42);
-    std::normal_distribution<float> dist(0.0f, 1.0f);
-
-    std::vector<__nv_bfloat16> h_A(M * N), h_B(16 * 16);
-    for (auto& v : h_A) v = __float2bfloat16(dist(gen));
+// Fill the 16x16 Hadamard matrix (scaled by 0.25)
+static void fill_hadamard(std::vector<__nv_bfloat16>& h_B) {
+    h_B.resize(16 * 16);
     for (int r = 0; r < 16; r++)
         for (int c = 0; c < 16; c++) {
             int sign = __builtin_popcount(r & c) % 2 == 0 ? 1 : -1;
             h_B[r * 16 + c] = __float2bfloat16(sign * 0.25f);
         }
-    float global_amax_val = 4.0f;
+}
+
+bool run_comparison(int M, int N,
+                    const char* label = nullptr,
+                    std::vector<__nv_bfloat16>* custom_A = nullptr,
+                    float global_amax_val = 4.0f) {
+    if (label)
+        printf("--- %s (%d x %d, amax=%.4g) ---\n", label, M, N, global_amax_val);
+    else
+        printf("--- %d x %d ---\n", M, N);
+
+    std::vector<__nv_bfloat16> h_A_default, h_B;
+    fill_hadamard(h_B);
+
+    if (!custom_A) {
+        std::mt19937 gen(42);
+        std::normal_distribution<float> dist(0.0f, 1.0f);
+        h_A_default.resize(M * N);
+        for (auto& v : h_A_default) v = __float2bfloat16(dist(gen));
+        custom_A = &h_A_default;
+    }
+
     size_t rng_h[2] = {12345, 0};
 
     __nv_bfloat16 *d_A, *d_B;
@@ -109,7 +125,7 @@ bool run_comparison(int M, int N) {
     CHECK_CUDA(cudaMalloc(&d_C_ref, c_bytes));
     CHECK_CUDA(cudaMalloc(&d_SFC_ref, sfc_bytes));
 
-    CHECK_CUDA(cudaMemcpy(d_A, h_A.data(), M * N * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_A, custom_A->data(), M * N * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_B, h_B.data(), 256 * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_amax, &global_amax_val, sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_rng, rng_h, 2 * sizeof(size_t), cudaMemcpyHostToDevice));
@@ -217,10 +233,55 @@ int main() {
     int pass = 0, total = 0;
     auto test = [&](int m, int n) { total++; if (run_comparison(m, n)) pass++; };
 
+    // Standard random data
     test(256, 128);
     test(1024, 1024);
     test(8192, 5120);
 
-    printf("=== %d / %d tests matched ===\n", pass, total);
+    // Extreme data tests — compare both kernels with edge-case inputs
+    printf("\n=== Extreme Data Tests ===\n");
+    constexpr int EM = 256, EN = 128;
+    std::mt19937 gen(42);
+    auto extreme = [&](const char* label, auto fill_fn, float amax) {
+        std::vector<__nv_bfloat16> A(EM * EN);
+        fill_fn(A);
+        total++;
+        if (run_comparison(EM, EN, label, &A, amax)) pass++;
+    };
+
+    extreme("all_zeros", [](auto& A) {
+        for (auto& v : A) v = __float2bfloat16(0.0f);
+    }, 1.0f);
+
+    extreme("all_zeros_amax0", [](auto& A) {
+        for (auto& v : A) v = __float2bfloat16(0.0f);
+    }, 0.0f);
+
+    extreme("very_small", [&](auto& A) {
+        for (auto& v : A) v = __float2bfloat16((gen()%2?1:-1) * 1e-6f * (1+(gen()%100)/100.f));
+    }, 1e-4f);
+
+    extreme("very_large", [&](auto& A) {
+        for (auto& v : A) v = __float2bfloat16((gen()%2?1:-1) * (500.f + gen()%1000));
+    }, 1000.0f);
+
+    extreme("very_large_small_amax", [&](auto& A) {
+        for (auto& v : A) v = __float2bfloat16((gen()%2?1:-1) * (500.f + gen()%1000));
+    }, 1.0f);
+
+    extreme("sparse_outliers", [&](auto& A) {
+        for (int i = 0; i < EM * EN; i++)
+            A[i] = __float2bfloat16(gen()%256==0 ? (gen()%2?100.f:-100.f) : 0.f);
+    }, 100.0f);
+
+    extreme("uniform_one", [](auto& A) {
+        for (auto& v : A) v = __float2bfloat16(1.0f);
+    }, 4.0f);
+
+    extreme("uniform_one_tiny_amax", [](auto& A) {
+        for (auto& v : A) v = __float2bfloat16(1.0f);
+    }, 0.001f);
+
+    printf("\n=== %d / %d tests matched ===\n", pass, total);
     return (pass == total) ? 0 : 1;
 }
