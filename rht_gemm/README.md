@@ -51,20 +51,44 @@ and `n % 64 == 0`.
 
 ## Building
 
+### Correctness test + benchmark (SM120)
+
+Runs on RTX 5090 or any SM120 family GPU. Compares the kernel output against
+a naive CPU reference.
+
 ```bash
-# Default: compile for SM120a
-make
-
-# Compile for a specific architecture
-make CUDA_ARCH=120f
-make CUDA_ARCH=121a
-
-# Run correctness tests + benchmark
+make                        # default CUDA_ARCH=120a
+make CUDA_ARCH=120f         # family-compatible
+make CUDA_ARCH=121a         # SM121 specific
 ./test_correctness.exe
 ```
 
-Requires CUDA 13.1+ and CUTLASS headers (for include path only — no CUTLASS
-runtime dependency).
+Requires CUDA 13.1+ and CUTLASS headers at `$CUTLASS_HOME` (default
+`/home/harry/cutlass`). Header-only — no CUTLASS runtime dependency.
+
+### Comparison test vs TE reference (SM100)
+
+Compiles both our WMMA kernel and the original Transformer Engine SM100
+UMMA kernel into a single binary. Must be **run on an SM100 GPU** (GB200,
+B200, etc.) to execute both kernels and compare outputs byte-by-byte.
+
+```bash
+make test_compare.exe       # compiles for compute_100a
+./test_compare.exe          # run on GB200
+```
+
+Additional requirements:
+
+- **CUTLASS** source at `$CUTLASS_HOME` (default `/home/harry/cutlass`)
+- **Transformer Engine** source at `$TE_HOME` (default
+  `/home/harry/TransformerEngine`) — only the header files are used
+- The TE headers with heavy dependencies (cuDNN, etc.) are replaced by
+  minimal stubs in `te_ref/stubs/`; the real TE `ptx.cuh` and
+  `curanddx.hpp` are symlinked from the TE source tree
+
+The comparison test uses separate compilation (`-rdc=true`) to isolate our
+kernel's includes (`sr.sm120.cuh`) from the TE reference's includes
+(`ptx.cuh`) which define overlapping symbols.
 
 ## Performance
 
@@ -86,6 +110,12 @@ L2 cache lines.
 ## Files
 
 - `rht_gemm_sm120.cuh` — Main kernel header (drop-in replacement)
+- `sr.sm120.cuh` — Symlink to `../stochastic_rounding/sr.sm120.cuh` (FP4 SR polyfill)
 - `test_correctness.cu` — Correctness test vs naive CPU reference + benchmark
-- `test_compare.cu` — Comparison test for SM100 vs SM120 output
-- `te_ref/` — Original Transformer Engine reference implementation (SM100 only)
+- `test_compare.cu` — Main driver for SM100 comparison test
+- `test_compare_ours.cu` — Our kernel instantiation (separate TU)
+- `test_compare_ref.cu` — TE reference kernel instantiation (separate TU)
+- `te_ref/` — Original TE reference implementation (SM100 only)
+  - `hadamard_transform_cast_fusion.cu` — Full TE source (for reference)
+  - `hadamard_transform_cast_fusion_core.inc` — Extracted core kernel code
+  - `stubs/` — Minimal header stubs replacing TE's heavy dependencies
